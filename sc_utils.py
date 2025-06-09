@@ -1,4 +1,5 @@
 import sys
+import os
 
 import numpy as np
 import torch
@@ -1156,3 +1157,296 @@ class ProteinFeatures(nn.Module):
         F = self.dec_edge_embedding1(F)
         F = self.dec_norm_edges1(F)
         return V, F
+
+
+def get_atom_coords(pdb_atom_group, atom_name_list):
+    """
+    Selects specified atoms from a ProDy AtomGroup and returns their coordinates.
+
+    Args:
+        pdb_atom_group: A ProDy AtomGroup object.
+        atom_name_list: A list of strings, where each string is an atom name
+                        (e.g., ['FE'], ['O2A', 'O2D']).
+
+    Returns:
+        A NumPy array of atom coordinates if atoms are found, otherwise an
+        empty NumPy array.
+    """
+    if pdb_atom_group is None:
+        return np.array([])
+
+    sel_str = "name " + " ".join(atom_name_list)
+    selection = pdb_atom_group.select(sel_str)
+
+    if selection is None or selection.numAtoms() == 0:
+        return np.array([])
+    else:
+        return selection.getCoords()
+
+
+def get_residue_atom_coords_for_sequence(
+    sequence_aatype_tensor,
+    residue_char,
+    atom_names_of_interest,
+    X_coords_tensor,
+    restype_int_to_str_map,
+    restype_1to3_map,  # Added this based on reasoning
+    restype_name_to_atom14_names_map
+):
+    """
+    Extracts specified atom coordinates for a given residue type from a sequence
+    and its corresponding 3D coordinate tensor.
+
+    Args:
+        sequence_aatype_tensor: PyTorch tensor of integer amino acid types.
+        residue_char: Single character of the target residue (e.g., 'H').
+        atom_names_of_interest: List of atom names for that residue (e.g., ['NE2', 'CD2']).
+        X_coords_tensor: PyTorch tensor of packed structure coordinates (shape [L, 14, 3]).
+        restype_int_to_str_map: Dictionary mapping integer AA types to 1-letter string.
+        restype_1to3_map: Dictionary mapping 1-letter AA types to 3-letter string.
+        restype_name_to_atom14_names_map: Dictionary mapping 3-letter AA name to list of 14 atom names.
+
+    Returns:
+        A NumPy array of all collected coordinates. If no such atoms are found,
+        returns an empty NumPy array (e.g., np.empty((0,3))).
+    """
+    if not isinstance(X_coords_tensor, torch.Tensor) or not isinstance(sequence_aatype_tensor, torch.Tensor):
+        # This check is more for robustness, assuming inputs are as described.
+        # Depending on typical usage, might raise error or convert.
+        # For now, let's assume they are tensors.
+        pass
+
+    sequence_str = [restype_int_to_str_map[aa_int.item()] for aa_int in sequence_aatype_tensor]
+
+    collected_coords_list = []
+
+    residue_3_letter = restype_1to3_map.get(residue_char)
+    if not residue_3_letter:
+        return np.empty((0, 3)) # Residue char not found in map
+
+    atom_names_for_residue_type = restype_name_to_atom14_names_map.get(residue_3_letter)
+    if not atom_names_for_residue_type:
+        return np.empty((0, 3)) # 3-letter residue name not in map
+
+    for res_idx, aa_char_in_seq in enumerate(sequence_str):
+        if aa_char_in_seq == residue_char:
+            # Current residue matches the target residue type
+            for atom_name_target in atom_names_of_interest:
+                try:
+                    # Find the index of the target atom in the 14 standard atom names for this residue type
+                    atom_idx_in_14 = atom_names_for_residue_type.index(atom_name_target)
+
+                    # Check if the atom name is not an empty string (placeholder)
+                    if atom_names_for_residue_type[atom_idx_in_14] != "":
+                        coords = X_coords_tensor[res_idx, atom_idx_in_14, :].cpu().numpy()
+                        collected_coords_list.append(coords)
+                except ValueError:
+                    # Atom name not found in the standard list for this residue, skip
+                    pass
+
+    if not collected_coords_list:
+        return np.empty((0, 3))
+    else:
+        return np.array(collected_coords_list)
+
+
+def _min_distance_between_sets(coords_set1, coords_set2):
+    """
+    Calculates the minimum distance between two sets of coordinates.
+
+    Args:
+        coords_set1: NumPy array of shape (N, 3).
+        coords_set2: NumPy array of shape (M, 3).
+
+    Returns:
+        Minimum distance, or float('inf') if either set is empty.
+    """
+    if not isinstance(coords_set1, np.ndarray) or not isinstance(coords_set2, np.ndarray):
+        # Ensure inputs are numpy arrays, helps if previous functions sometimes return lists
+        coords_set1 = np.array(coords_set1)
+        coords_set2 = np.array(coords_set2)
+
+    if coords_set1.ndim != 2 or coords_set1.shape[1] != 3:
+        # Reshape if it's a single coordinate (3,) to (1,3)
+        if coords_set1.ndim == 1 and coords_set1.shape[0] == 3:
+            coords_set1 = coords_set1.reshape(1, 3)
+        elif coords_set1.shape[0] == 0 : # handle empty array from get_atom_coords
+             return float('inf')
+        else: # Invalid shape
+            raise ValueError("coords_set1 has invalid shape")
+
+
+    if coords_set2.ndim != 2 or coords_set2.shape[1] != 3:
+        if coords_set2.ndim == 1 and coords_set2.shape[0] == 3:
+            coords_set2 = coords_set2.reshape(1, 3)
+        elif coords_set2.shape[0] == 0: # handle empty array from get_atom_coords
+            return float('inf')
+        else: # Invalid shape
+            raise ValueError("coords_set2 has invalid shape")
+
+    if coords_set1.shape[0] == 0 or coords_set2.shape[0] == 0:
+        return float('inf')
+
+    # Efficiently calculate all pairwise distances
+    # (N, 1, 3) - (1, M, 3) = (N, M, 3)
+    diff = coords_set1[:, np.newaxis, :] - coords_set2[np.newaxis, :, :]
+    distances_sq = np.sum(diff**2, axis=2)  # Shape (N, M)
+
+    if distances_sq.size == 0: # Should be caught by initial shape checks, but as a safeguard
+        return float('inf')
+
+    return np.sqrt(np.min(distances_sq))
+
+
+def is_sequence_valid(
+    sequence_tensor,
+    packed_coords_tensor,
+    other_atoms_prody_group,
+    distance_thresholds,
+    data_utils_maps
+):
+    """
+    Validates a sequence based on amino acid composition and distance criteria.
+
+    Args:
+        sequence_tensor: PyTorch tensor (e.g., S_stack[ix]).
+        packed_coords_tensor: PyTorch tensor (e.g., X_stack[ix]).
+        other_atoms_prody_group: ProDy AtomGroup for ligands/metals.
+        distance_thresholds: Dict like {'his_fe': 5.0, 'arg_heme': 4.0}.
+        data_utils_maps: Dict containing 'restype_int_to_str',
+                                     'restype_name_to_atom14_names',
+                                     'restype_1to3'.
+    Returns:
+        True if all checks pass, False otherwise.
+    """
+    # Ensure maps are available
+    restype_int_to_str = data_utils_maps.get('restype_int_to_str')
+    restype_name_to_atom14_names = data_utils_maps.get('restype_name_to_atom14_names')
+    restype_1to3 = data_utils_maps.get('restype_1to3')
+
+    if not all([restype_int_to_str, restype_name_to_atom14_names, restype_1to3]):
+        # Or raise an error, depending on desired behavior for missing maps
+        # print("Error: Missing one or more essential data utility maps.", file=sys.stderr)
+        return False
+
+    # 1. Amino Acid Composition Check
+    sequence_str_list = [restype_int_to_str[aa_int.item()] for aa_int in sequence_tensor]
+    sequence_str = "".join(sequence_str_list)
+
+    if sequence_str.count('H') == 0: return False
+    if sequence_str.count('R') == 0: return False
+    if sequence_str.count('Y') == 0: return False
+    if sequence_str.count('W') == 0: return False
+
+    # 2. Atom Coordinate Extraction
+    # Fe atom coordinates
+    fe_coords = get_atom_coords(other_atoms_prody_group, ['FE'])
+    if fe_coords.shape[0] == 0:
+        return False
+
+    # Heme oxygen atom coordinates
+    heme_oxy_coords = get_atom_coords(other_atoms_prody_group, ['O2A', 'O2D', 'O1D', 'O1A'])
+    if heme_oxy_coords.shape[0] == 0:
+        return False
+
+    # Histidine NE2/CD2 coordinates
+    # (Could also use 'ND1', 'CE1' depending on expected coordination mode)
+    his_atom_names = ['NE2', 'CD2']
+    his_coords = get_residue_atom_coords_for_sequence(
+        sequence_tensor, 'H', his_atom_names, packed_coords_tensor,
+        restype_int_to_str, restype_1to3, restype_name_to_atom14_names
+    )
+    if his_coords.shape[0] == 0: # Should be caught by composition check, but good for robustness
+        return False
+
+    # Arginine NH1/NH2/CZ coordinates
+    arg_atom_names = ['NH1', 'NH2', 'CZ']
+    arg_coords = get_residue_atom_coords_for_sequence(
+        sequence_tensor, 'R', arg_atom_names, packed_coords_tensor,
+        restype_int_to_str, restype_1to3, restype_name_to_atom14_names
+    )
+    if arg_coords.shape[0] == 0: # Should be caught by composition check
+        return False
+
+    # 3. Distance Calculations
+    # Histidine-Fe distance
+    min_his_fe_dist = _min_distance_between_sets(his_coords, fe_coords)
+    if min_his_fe_dist > distance_thresholds.get('his_fe', float('inf')):
+        return False
+
+    # Arginine-Heme oxygen distance
+    min_arg_heme_dist = _min_distance_between_sets(arg_coords, heme_oxy_coords)
+    if min_arg_heme_dist > distance_thresholds.get('arg_heme', float('inf')):
+        return False
+
+    # 4. Return Value
+    return True
+
+
+def cleanup_files(
+    base_output_folder,
+    pdb_name,
+    selected_sequence_indices, # 0-based
+    all_sequence_indices,      # 0-based
+    num_packs_per_design,
+    file_ending,
+    packed_suffix,
+    delete_all_outputs_for_pdb,
+    apply_filter_flag,
+    zero_indexed_bool # True if args.zero_indexed == 1, else False
+):
+    """
+    Deletes output PDB files based on filtering results.
+
+    Args:
+        base_output_folder: Path to the main output directory.
+        pdb_name: Name of the PDB file (without .pdb extension).
+        selected_sequence_indices: List of 0-based indices of sequences that passed filters.
+        all_sequence_indices: List of all 0-based indices of sequences generated for this PDB.
+        num_packs_per_design: Number of packed PDBs generated per sequence.
+        file_ending: File ending string (e.g., "_model_1").
+        packed_suffix: Suffix for packed files (e.g., "_packed").
+        delete_all_outputs_for_pdb: Boolean, True if all files for this PDB should be deleted.
+        apply_filter_flag: Boolean, if False, this function does nothing.
+        zero_indexed_bool: Boolean, True if file naming is 0-indexed, False for 1-indexed.
+    """
+    if not apply_filter_flag:
+        return
+
+    backbones_dir = os.path.join(base_output_folder, 'backbones')
+    packed_dir = os.path.join(base_output_folder, 'packed')
+
+    indices_to_delete_0_based = []
+    if delete_all_outputs_for_pdb:
+        indices_to_delete_0_based = list(all_sequence_indices)
+    else:
+        # Need to find which ones were NOT selected
+        selected_set = set(selected_sequence_indices)
+        for idx in all_sequence_indices:
+            if idx not in selected_set:
+                indices_to_delete_0_based.append(idx)
+
+    for idx_0_based in indices_to_delete_0_based:
+        file_index_str = str(idx_0_based if zero_indexed_bool else idx_0_based + 1)
+
+        # Delete backbone file
+        backbone_file_path = os.path.join(backbones_dir, f"{pdb_name}_{file_index_str}{file_ending}.pdb")
+        if os.path.exists(backbone_file_path):
+            try:
+                os.remove(backbone_file_path)
+                # print(f"Deleted: {backbone_file_path}", file=sys.stderr) # Optional: for debugging
+            except OSError as e:
+                print(f"Error deleting file {backbone_file_path}: {e}", file=sys.stderr)
+
+        # Delete packed files
+        for pack_num in range(1, num_packs_per_design + 1):
+            packed_file_path = os.path.join(
+                packed_dir,
+                f"{pdb_name}{packed_suffix}_{file_index_str}_{pack_num}{file_ending}.pdb"
+            )
+            if os.path.exists(packed_file_path):
+                try:
+                    os.remove(packed_file_path)
+                    # print(f"Deleted: {packed_file_path}", file=sys.stderr) # Optional: for debugging
+                except OSError as e:
+                    print(f"Error deleting file {packed_file_path}: {e}", file=sys.stderr)

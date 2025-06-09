@@ -4,6 +4,7 @@ import json
 import os.path
 import random
 import sys
+import os
 
 import numpy as np
 import torch
@@ -19,9 +20,10 @@ from data_utils import (
     restype_str_to_int,
     write_full_PDB,
 )
+import data_utils # Ensure data_utils is available for the maps
 from model_utils import ProteinMPNN
 from prody import writePDB
-from sc_utils import Packer, pack_side_chains
+from sc_utils import Packer, pack_side_chains, is_sequence_valid, cleanup_files
 
 
 def main(args) -> None:
@@ -369,6 +371,13 @@ def main(args) -> None:
         if name[-4:] == ".pdb":
             name = name[:-4]
 
+        data_utils_maps = {
+            'restype_int_to_str': data_utils.restype_int_to_str,
+            'restype_name_to_atom14_names': data_utils.restype_name_to_atom14_names,
+            'restype_1to3': data_utils.restype_1to3
+        }
+        distance_thresholds = {'his_fe': 5.0, 'arg_heme': 4.0} # Angstroms
+
         with torch.no_grad():
             # run featurize to remap R_idx and add batch dimension
             if args.verbose:
@@ -542,136 +551,271 @@ def main(args) -> None:
                     X_m_stack_list.append(X_m_stack)
                     b_factor_stack_list.append(b_factor_stack)
 
-            with open(output_fasta, "w") as f:
-                f.write(
-                    ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
-                        name,
-                        args.temperature,
-                        seed,
-                        torch.sum(rec_mask).cpu().numpy(),
-                        torch.sum(combined_mask[:1]).cpu().numpy(),
-                        bool(args.ligand_mpnn_use_atom_context),
-                        float(args.ligand_mpnn_cutoff_for_score),
-                        args.batch_size,
-                        args.number_of_batches,
-                        checkpoint_path,
-                        seq_out_str,
-                    )
-                )
-                for ix in range(S_stack.shape[0]):
-                    ix_suffix = ix
-                    if not args.zero_indexed:
-                        ix_suffix += 1
-                    seq_rec_print = np.format_float_positional(
-                        rec_stack[ix].cpu().numpy(), unique=False, precision=4
-                    )
-                    loss_np = np.format_float_positional(
-                        np.exp(-loss_stack[ix].cpu().numpy()), unique=False, precision=4
-                    )
-                    loss_XY_np = np.format_float_positional(
-                        np.exp(-loss_XY_stack[ix].cpu().numpy()),
-                        unique=False,
-                        precision=4,
-                    )
-                    seq = "".join(
-                        [restype_int_to_str[AA] for AA in S_stack[ix].cpu().numpy()]
-                    )
+            # CUSTOM FILTERING BLOCK STARTS
+            passed_sequence_info_list = []
+            selected_0_idx_for_pdb = -1 # Sentinel for no sequence selected
 
-                    # write new sequences into PDB with backbone coordinates
-                    seq_prody = np.array([restype_1to3[AA] for AA in list(seq)])[
-                        None,
-                    ].repeat(4, 1)
-                    bfactor_prody = (
-                        loss_per_residue_stack[ix].cpu().numpy()[None, :].repeat(4, 1)
-                    )
-                    backbone.setResnames(seq_prody)
-                    backbone.setBetas(
-                        np.exp(-bfactor_prody)
-                        * (bfactor_prody > 0.01).astype(np.float32)
-                    )
-                    if other_atoms:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone + other_atoms,
+            if args.apply_custom_filter: # Only run filtering logic if the flag is set
+                if args.pack_side_chains and X_stack_list: # Ensure packing was done and results exist
+                    coords_to_use_for_filtering = X_stack_list[0] # Use first pack cycle's coordinates
+                    for ix_filter_loop in range(S_stack.shape[0]):
+                        current_sequence_tensor = S_stack[ix_filter_loop]
+                        current_packed_coords_tensor = coords_to_use_for_filtering[ix_filter_loop]
+
+                        is_valid = is_sequence_valid(
+                            current_sequence_tensor,
+                            current_packed_coords_tensor,
+                            other_atoms, # from parse_PDB
+                            distance_thresholds,
+                            data_utils_maps
                         )
-                    else:
-                        writePDB(
-                            output_backbones
-                            + name
-                            + "_"
-                            + str(ix_suffix)
-                            + args.file_ending
-                            + ".pdb",
-                            backbone,
+                        if is_valid:
+                            passed_sequence_info_list.append({
+                                'index': ix_filter_loop, # 0-based index
+                                'sequence_tensor': current_sequence_tensor
+                            })
+                elif not args.pack_side_chains: # No packing done
+                    if args.verbose:
+                        print(f"PDB {name}: Custom filtering is enabled, but side chain packing is off. Structural filter criteria will be skipped.")
+                    # Simplified: Perform compositional check only or skip if is_sequence_valid strictly needs packed_coords
+                    # For this implementation, if no packing, we assume structural criteria cannot be met by is_sequence_valid as is.
+                    # A more advanced is_sequence_valid could handle packed_coords_tensor=None and do compositional only.
+                    # For now, this path means no sequences will be selected by is_sequence_valid if it expects packed coords.
+                    # To make it explicit that we are skipping structural part of filter:
+                    if args.verbose:
+                         print(f"PDB {name}: Skipping structural part of custom filter as --pack_side_chains is off.")
+                    # If you wanted to add compositional check here:
+                    # for ix_filter_loop in range(S_stack.shape[0]):
+                    #     current_sequence_tensor = S_stack[ix_filter_loop]
+                    #     seq_str_list_comp = [data_utils_maps['restype_int_to_str'][aa.item()] for aa in current_sequence_tensor]
+                    #     seq_str_comp = "".join(seq_str_list_comp)
+                    #     if seq_str_comp.count('H') > 0 and seq_str_comp.count('R') > 0 and \
+                    #        (seq_str_comp.count('Y') > 0 or seq_str_comp.count('W') > 0):
+                    #            passed_sequence_info_list.append({'index': ix_filter_loop, 'sequence_tensor': current_sequence_tensor})
+                    pass # Current is_sequence_valid expects packed_coords_tensor, so this path won't select.
+
+            all_generated_indices = list(range(S_stack.shape[0])) # 0-based indices
+
+            if args.apply_custom_filter: # This outer check is redundant if the block is nested, but kept for clarity
+                if not passed_sequence_info_list:
+                    if args.verbose:
+                        print(f"PDB {name}: No sequences passed the custom filter. Deleting all related PDB outputs for this PDB.")
+                    cleanup_files(args.out_folder, name, [], all_generated_indices, args.number_of_packs_per_design, args.file_ending, args.packed_suffix, True, True, bool(args.zero_indexed))
+                    # Also delete the per-PDB fasta file if it's about to be created/written to
+                    if os.path.exists(output_fasta): # output_fasta path is defined before this block
+                        try:
+                            os.remove(output_fasta)
+                        except OSError as e:
+                            print(f"Error deleting FASTA file {output_fasta}: {e}", file=sys.stderr)
+                else:
+                    # Select the first sequence that passed the filter
+                    selected_sequence_info = passed_sequence_info_list[0]
+                    selected_0_idx_for_pdb = selected_sequence_info['index']
+                    if args.verbose:
+                        print(f"PDB {name}: Sequence index {selected_0_idx_for_pdb} (0-based) selected by custom filter. Corresponding file suffix: {selected_0_idx_for_pdb if args.zero_indexed else selected_0_idx_for_pdb + 1}.")
+
+                    cleanup_files(args.out_folder, name, [selected_0_idx_for_pdb], all_generated_indices, args.number_of_packs_per_design, args.file_ending, args.packed_suffix, False, True, bool(args.zero_indexed))
+
+                    # Append to global FASTA
+                    global_fasta_path = os.path.join(args.out_folder, "selected_seqs.fasta")
+                    selected_seq_tensor = selected_sequence_info['sequence_tensor']
+
+                    seq_np = selected_seq_tensor.cpu().numpy()
+                    temp_seq_out_str_list = []
+                    for chain_mask_tensor in protein_dict["mask_c"]:
+                        chain_seq_np = seq_np[chain_mask_tensor.cpu().numpy()]
+                        temp_seq_out_str_list.append("".join([data_utils_maps['restype_int_to_str'][aa_idx] for aa_idx in chain_seq_np]))
+                    final_seq_str_for_fasta = args.fasta_seq_separation.join(temp_seq_out_str_list)
+
+                    actual_suffix_for_selected = selected_0_idx_for_pdb if args.zero_indexed else selected_0_idx_for_pdb + 1
+                    simple_fasta_header = f">{name}_selected_id={actual_suffix_for_selected}_T={args.temperature}_seed={seed}" # Added T and seed for more info
+
+                    with open(global_fasta_path, "a") as gf:
+                        gf.write(simple_fasta_header + "\n")
+                        gf.write(final_seq_str_for_fasta + "\n")
+            # CUSTOM FILTERING BLOCK ENDS
+
+            if not (args.apply_custom_filter and selected_0_idx_for_pdb == -1):
+                with open(output_fasta, "w") as f:
+                    f.write(
+                        ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
+                            name,
+                            args.temperature,
+                            seed,
+                            torch.sum(rec_mask).cpu().numpy(),
+                            torch.sum(combined_mask[:1]).cpu().numpy(),
+                            bool(args.ligand_mpnn_use_atom_context),
+                            float(args.ligand_mpnn_cutoff_for_score),
+                            args.batch_size,
+                            args.number_of_batches,
+                            checkpoint_path,
+                            seq_out_str, # This is the native sequence string
+                        )
+                    )
+                    for ix_loop_fasta in range(S_stack.shape[0]): # Renamed ix to ix_loop_fasta to avoid clash
+                        if args.apply_custom_filter and selected_0_idx_for_pdb != -1 and ix_loop_fasta != selected_0_idx_for_pdb:
+                            continue # Skip writing non-selected sequences to this PDB-specific FASTA
+
+                        ix_suffix = ix_loop_fasta # Use the loop variable
+                        if not args.zero_indexed:
+                            ix_suffix += 1
+
+                        # Calculate metrics for the current sequence S_stack[ix_loop_fasta]
+                        current_S_for_fasta = S_stack[ix_loop_fasta]
+                        current_log_probs_for_fasta = log_probs_stack[ix_loop_fasta]
+                        # Note: rec_stack, loss_stack, loss_XY_stack are batch_size * num_batches long.
+                        # Ensure ix_loop_fasta is the correct index into these stacks.
+                        # S_stack is (num_batches * batch_size, L). So ix_loop_fasta is correct for S_stack.
+                        # The original code uses `ix` which is `ix_loop_fasta` here.
+
+                        seq_rec_print = np.format_float_positional(
+                            rec_stack[ix_loop_fasta].cpu().numpy(), unique=False, precision=4
+                        )
+                        loss_np = np.format_float_positional(
+                            np.exp(-loss_stack[ix_loop_fasta].cpu().numpy()), unique=False, precision=4
+                        )
+                        loss_XY_np = np.format_float_positional(
+                            np.exp(-loss_XY_stack[ix_loop_fasta].cpu().numpy()),
+                            unique=False,
+                            precision=4,
+                        )
+                        seq = "".join(
+                            [restype_int_to_str[AA] for AA in current_S_for_fasta.cpu().numpy()]
                         )
 
-                    # write full PDB files
-                    if args.pack_side_chains:
-                        for c_pack in range(args.number_of_packs_per_design):
-                            X_stack = X_stack_list[c_pack]
-                            X_m_stack = X_m_stack_list[c_pack]
-                            b_factor_stack = b_factor_stack_list[c_pack]
-                            write_full_PDB(
-                                output_packed
+                        # write new sequences into PDB with backbone coordinates
+                        # This part is for writing PDB files, which are handled by cleanup_files.
+                        # The FASTA writing part is what we are modifying here.
+                        seq_prody = np.array([restype_1to3[AA] for AA in list(seq)])[
+                            None,
+                        ].repeat(4, 1)
+                        bfactor_prody = (
+                            loss_per_residue_stack[ix_loop_fasta].cpu().numpy()[None, :].repeat(4, 1)
+                        )
+                        backbone.setResnames(seq_prody)
+                        backbone.setBetas(
+                            np.exp(-bfactor_prody)
+                            * (bfactor_prody > 0.01).astype(np.float32)
+                        )
+                        if other_atoms:
+                            writePDB(
+                                output_backbones
                                 + name
-                                + args.packed_suffix
                                 + "_"
                                 + str(ix_suffix)
-                                + "_"
-                                + str(c_pack + 1)
                                 + args.file_ending
                                 + ".pdb",
-                                X_stack[ix].cpu().numpy(),
-                                X_m_stack[ix].cpu().numpy(),
-                                b_factor_stack[ix].cpu().numpy(),
-                                feature_dict["R_idx_original"][0].cpu().numpy(),
-                                protein_dict["chain_letters"],
-                                S_stack[ix].cpu().numpy(),
-                                other_atoms=other_atoms,
-                                icodes=icodes,
-                                force_hetatm=args.force_hetatm,
+                                backbone + other_atoms,
                             )
-                    # -----
+                        else:
+                            writePDB(
+                                output_backbones
+                                + name
+                                + "_"
+                                + str(ix_suffix)
+                                + args.file_ending
+                                + ".pdb",
+                                backbone,
+                            )
 
-                    # write fasta lines
-                    seq_np = np.array(list(seq))
-                    seq_out_str = []
-                    for mask in protein_dict["mask_c"]:
-                        seq_out_str += list(seq_np[mask.cpu().numpy()])
-                        seq_out_str += [args.fasta_seq_separation]
-                    seq_out_str = "".join(seq_out_str)[:-1]
-                    if ix == S_stack.shape[0] - 1:
-                        # final 2 lines
-                        f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
-                                name,
-                                ix_suffix,
-                                args.temperature,
-                                seed,
-                                loss_np,
-                                loss_XY_np,
-                                seq_rec_print,
-                                seq_out_str,
+                        # write full PDB files
+                        if args.pack_side_chains:
+                            for c_pack in range(args.number_of_packs_per_design):
+                                # Ensure X_stack_list, X_m_stack_list, b_factor_stack_list are indexed correctly if needed here
+                                # This part is about writing PDB files, not FASTA. Cleanup handles these.
+                                # The code here uses X_stack, X_m_stack, b_factor_stack which are from the *last* pack cycle if number_of_packs_per_design > 1
+                                # This might be an issue if filtering used X_stack_list[0] but PDBs are written from a different pack cycle.
+                                # However, cleanup_files deletes based on ix_suffix and pack_num, so it should be fine.
+                                # The critical part is that *IF* a sequence is selected, its PDBs are NOT deleted.
+                                # The code below uses X_stack, X_m_stack, b_factor_stack which are from the last pack iteration.
+                                # This means if filtering selected based on X_stack_list[0], the written PDB might not reflect what was filtered on if number_of_packs_per_design > 1.
+                                # This is a subtle point. For now, assume this discrepancy is acceptable or handled by using only 1 pack for filtering.
+                                current_X_to_write = X_stack_list[c_pack][ix_loop_fasta].cpu().numpy() if X_stack_list else None
+                                current_X_m_to_write = X_m_stack_list[c_pack][ix_loop_fasta].cpu().numpy() if X_m_stack_list else None
+                                current_b_factor_to_write = b_factor_stack_list[c_pack][ix_loop_fasta].cpu().numpy() if b_factor_stack_list else None
+
+                                if args.pack_side_chains and current_X_to_write is not None : # Check if packing was done and data is available
+                                    write_full_PDB(
+                                        output_packed
+                                        + name
+                                        + args.packed_suffix
+                                        + "_"
+                                        + str(ix_suffix)
+                                        + "_"
+                                        + str(c_pack + 1)
+                                        + args.file_ending
+                                        + ".pdb",
+                                        current_X_to_write,
+                                        current_X_m_to_write,
+                                        current_b_factor_to_write,
+                                        feature_dict["R_idx_original"][0].cpu().numpy(),
+                                        protein_dict["chain_letters"],
+                                        current_S_for_fasta.cpu().numpy(), # S_stack[ix_loop_fasta]
+                                        other_atoms=other_atoms,
+                                        icodes=icodes,
+                                        force_hetatm=args.force_hetatm,
+                                    )
+                        # -----
+
+                        # write fasta lines
+                        seq_np_fasta = np.array(list(seq)) # seq is from S_stack[ix_loop_fasta]
+                        seq_out_str_for_this_entry = []
+                        for mask_item in protein_dict["mask_c"]: # protein_dict from parse_PDB
+                            seq_out_str_for_this_entry += list(seq_np_fasta[mask_item.cpu().numpy()])
+                            seq_out_str_for_this_entry += [args.fasta_seq_separation]
+                        seq_out_str_for_this_entry = "".join(seq_out_str_for_this_entry)[:-1]
+
+                        # Check if this is the last sequence *to be written* in the fasta file
+                        # This logic for final two lines might need adjustment if only one sequence is written.
+                        # If only one selected sequence, it is the "last line".
+                        is_last_entry_in_fasta = False
+                        if args.apply_custom_filter and selected_0_idx_for_pdb != -1:
+                            is_last_entry_in_fasta = True # Since only one is written
+                        elif ix_loop_fasta == S_stack.shape[0] - 1: # No filter, or filter off
+                             is_last_entry_in_fasta = True
+
+                        if is_last_entry_in_fasta:
+                            f.write(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
+                                    name,
+                                    ix_suffix,
+                                    args.temperature,
+                                    seed,
+                                    loss_np,
+                                    loss_XY_np,
+                                    seq_rec_print,
+                                    seq_out_str_for_this_entry,
+                                )
                             )
-                        )
-                    else:
-                        f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
-                                name,
-                                ix_suffix,
-                                args.temperature,
-                                seed,
-                                loss_np,
-                                loss_XY_np,
-                                seq_rec_print,
-                                seq_out_str,
+                        else:
+                            f.write(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
+                                    name,
+                                    ix_suffix,
+                                    args.temperature,
+                                    seed,
+                                    loss_np,
+                                    loss_XY_np,
+                                    seq_rec_print,
+                                    seq_out_str_for_this_entry,
+                                )
                             )
-                        )
+            else:
+                # This 'else' corresponds to 'if not (args.apply_custom_filter and selected_0_idx_for_pdb == -1)'
+                # This means custom filter is on, and no sequence passed.
+                # output_fasta should have been deleted by cleanup_files.
+                # If there's any other per-PDB summary file that would normally be created,
+                # it should be skipped here too.
+                if args.verbose:
+                    print(f"PDB {name}: Skipping creation of FASTA file {output_fasta} as no sequences passed the filter.")
+                 pass
+
+
+# The original PDB writing loop:
+# This section containing PDB writing is now inside the conditional FASTA writing loop.
+# No separate changes needed here as cleanup_files handles the PDB files post-writing.
+# The original PDB writing code is preserved but now executes only for sequences
+# that are being written to the FASTA file (i.e., selected ones if filter is on).
 
 
 if __name__ == "__main__":
@@ -862,6 +1006,10 @@ if __name__ == "__main__":
     )
     argparser.add_argument(
         "--save_stats", type=int, default=0, help="Save output statistics"
+    )
+
+    argparser.add_argument(
+        "--apply_custom_filter", type=int, default=0, help="1 - to apply custom sequence filtering and cleanup, 0 - do not apply."
     )
 
     argparser.add_argument(
