@@ -632,16 +632,16 @@ def main(args) -> None:
                         bool(args.zero_indexed),
                     )
                     # Also delete the per-PDB fasta file if it's about to be created/written to
-                    if os.path.exists(
-                        output_fasta
-                    ):  # output_fasta path is defined before this block
-                        try:
-                            os.remove(output_fasta)
-                        except OSError as e:
-                            print(
-                                f"Error deleting FASTA file {output_fasta}: {e}",
-                                file=sys.stderr,
-                            )
+                    # if os.path.exists(
+                    #     output_fasta
+                    # ):  # output_fasta path is defined before this block
+                    #     try:
+                    #         os.remove(output_fasta)
+                    #     except OSError as e:
+                    #         print(
+                    #             f"Error deleting FASTA file {output_fasta}: {e}",
+                    #             file=sys.stderr,
+                    #         )
                 else:
                     # Select the first sequence that passed the filter
                     selected_sequence_info = passed_sequence_info_list[0]
