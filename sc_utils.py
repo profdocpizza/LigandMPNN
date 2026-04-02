@@ -115,7 +115,7 @@ def pack_side_chains(
             pred_frames,
             torsion_dict["aatype"],
             torch.tensor(restype_rigid_group_default_frame, device=device),
-            torch.tensor(restype_atom14_to_rigid_group, device=device),
+            torch.tensor(restype_atom14_to_rigid_group, device=device, dtype=torch.long),
             torch.tensor(restype_atom14_mask, device=device),
             torch.tensor(restype_atom14_rigid_group_positions, device=device),
         )
@@ -129,7 +129,7 @@ def pack_side_chains(
         ..., 0
     ] + 2.0 * (1 - torsion_dict["mask_fix_sc"][..., 0])
 
-    tmp_types = torch.tensor(restype_atom14_to_rigid_group, device=device)[S_af2]
+    tmp_types = torch.tensor(restype_atom14_to_rigid_group, device=device, dtype=torch.long)[S_af2]
     tmp_types[tmp_types < 4] = 4
     tmp_types -= 4
     atom_types_for_b_factor = torch.nn.functional.one_hot(tmp_types, 4)  # [B, L, 14, 4]
