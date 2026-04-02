@@ -24,10 +24,131 @@ from prody import writePDB
 from sc_utils import Packer, pack_side_chains
 
 
+def parse_fasta_sequences(fasta_path):
+    """
+    Parse FASTA file and return ordered list of sequence strings.
+    
+    Args:
+        fasta_path: Path to FASTA file
+        
+    Returns:
+        List of sequence strings in order they appear in file
+    """
+    sequences = []
+    current_seq = []
+    
+    with open(fasta_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                # New sequence header
+                if current_seq:
+                    sequences.append(''.join(current_seq))
+                    current_seq = []
+            else:
+                # Sequence data
+                current_seq.append(line.upper())
+        
+        # Add last sequence
+        if current_seq:
+            sequences.append(''.join(current_seq))
+    
+    return sequences
+
+
+def validate_sequences(sequences, chain_letters_list, R_idx_list, encoded_residues):
+    """
+    Validate that sequences match PDB structure.
+    
+    Args:
+        sequences: List of sequence strings
+        chain_letters_list: List of chain letters from PDB
+        R_idx_list: List of residue indices from PDB
+        encoded_residues: List of encoded residue names (e.g., 'A12', 'B5')
+        
+    Returns:
+        (is_valid, error_message)
+    """
+    # Get unique chains in alphabetical order
+    unique_chains = sorted(list(set(chain_letters_list)))
+    
+    # Check sequence count matches chain count
+    if len(sequences) != len(unique_chains):
+        return False, f"Sequence count ({len(sequences)}) does not match chain count ({len(unique_chains)}). Expected {len(unique_chains)} sequences for chains: {', '.join(unique_chains)}"
+    
+    # Check each sequence length and amino acids
+    for seq_idx, (seq, chain) in enumerate(zip(sequences, unique_chains)):
+        # Count residues in this chain
+        chain_residue_count = sum(1 for c in chain_letters_list if c == chain)
+        
+        if len(seq) != chain_residue_count:
+            return False, f"Sequence {seq_idx+1} (chain {chain}) length ({len(seq)}) does not match PDB chain length ({chain_residue_count})"
+        
+        # Check for valid amino acids
+        for i, aa in enumerate(seq):
+            if aa not in restype_str_to_int:
+                return False, f"Invalid amino acid '{aa}' at position {i+1} in sequence {seq_idx+1} (chain {chain}). Only standard 20 amino acids are supported."
+    
+    return True, ""
+
+
+def convert_sequences_to_tensor(sequences, chain_letters_list, device):
+    """
+    Convert sequence strings to PyTorch tensor matching model.sample() output format.
+    
+    Args:
+        sequences: List of sequence strings in chain order
+        chain_letters_list: List of chain letters from PDB
+        device: PyTorch device
+        
+    Returns:
+        Tensor of shape [1, num_residues] with amino acid indices
+    """
+    # Get unique chains in alphabetical order
+    unique_chains = sorted(list(set(chain_letters_list)))
+    
+    # Create mapping from chain to sequence
+    chain_to_seq = {chain: seq for chain, seq in zip(unique_chains, sequences)}
+    
+    # Build full sequence following PDB residue order
+    full_sequence = []
+    for chain in chain_letters_list:
+        seq = chain_to_seq[chain]
+        # Get the index of this residue within its chain
+        chain_residue_idx = sum(1 for c in chain_letters_list[:len(full_sequence)] if c == chain)
+        full_sequence.append(seq[chain_residue_idx])
+    
+    # Convert to indices
+    S = torch.tensor(
+        [[restype_str_to_int[aa] for aa in full_sequence]],
+        dtype=torch.long,
+        device=device
+    )
+    
+    return S
+
+
 def main(args) -> None:
     """
     Inference function
     """
+    # Validate pack-only mode arguments
+    if args.pack_only:
+        if not args.input_sequences and not args.input_sequences_multi:
+            print("ERROR: --pack_only requires either --input_sequences or --input_sequences_multi")
+            sys.exit(1)
+        if args.fixed_residues or args.fixed_residues_multi:
+            print("ERROR: --pack_only mode is incompatible with --fixed_residues (all residues must be specified in input sequences)")
+            sys.exit(1)
+        if args.redesigned_residues or args.redesigned_residues_multi:
+            print("ERROR: --pack_only mode is incompatible with --redesigned_residues (all residues must be specified in input sequences)")
+            sys.exit(1)
+        if not args.pack_side_chains:
+            print("WARNING: --pack_only mode automatically enables --pack_side_chains")
+            args.pack_side_chains = 1
+    
     if args.seed:
         seed = args.seed
     else:
@@ -122,6 +243,16 @@ def main(args) -> None:
             pdb_paths = list(json.load(fh))
     else:
         pdb_paths = [args.pdb_path]
+
+    # Load input sequences for pack-only mode
+    if args.pack_only:
+        if args.input_sequences_multi:
+            with open(args.input_sequences_multi, "r") as fh:
+                input_sequences_multi = json.load(fh)
+        else:
+            input_sequences_multi = {}
+            for pdb in pdb_paths:
+                input_sequences_multi[pdb] = args.input_sequences
 
     if args.fixed_residues_multi:
         with open(args.fixed_residues_multi, "r") as fh:
@@ -418,38 +549,82 @@ def main(args) -> None:
             loss_list = []
             loss_per_residue_list = []
             loss_XY_list = []
-            for _ in range(args.number_of_batches):
-                feature_dict["randn"] = torch.randn(
-                    [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
-                    device=device,
-                )
-                output_dict = model.sample(feature_dict)
-
-                # compute confidence scores
-                loss, loss_per_residue = get_score(
-                    output_dict["S"],
-                    output_dict["log_probs"],
-                    feature_dict["mask"] * feature_dict["chain_mask"],
-                )
-                if args.model_type == "ligand_mpnn":
-                    combined_mask = (
-                        feature_dict["mask"]
-                        * feature_dict["mask_XY"]
-                        * feature_dict["chain_mask"]
+            
+            # Pack-only mode: load sequences from FASTA and skip design
+            if args.pack_only:
+                try:
+                    # Load sequences from FASTA file
+                    fasta_path = input_sequences_multi[pdb]
+                    sequences = parse_fasta_sequences(fasta_path)
+                    
+                    # Validate sequences
+                    is_valid, error_msg = validate_sequences(
+                        sequences, chain_letters_list, R_idx_list, encoded_residues
                     )
-                else:
-                    combined_mask = feature_dict["mask"] * feature_dict["chain_mask"]
-                loss_XY, _ = get_score(
-                    output_dict["S"], output_dict["log_probs"], combined_mask
-                )
-                # -----
-                S_list.append(output_dict["S"])
-                log_probs_list.append(output_dict["log_probs"])
-                sampling_probs_list.append(output_dict["sampling_probs"])
-                decoding_order_list.append(output_dict["decoding_order"])
-                loss_list.append(loss)
-                loss_per_residue_list.append(loss_per_residue)
-                loss_XY_list.append(loss_XY)
+                    
+                    if not is_valid:
+                        print(f"WARNING: Skipping {pdb}: {error_msg}")
+                        continue
+                    
+                    # Convert sequences to tensor
+                    S = convert_sequences_to_tensor(sequences, chain_letters_list, device)
+                    
+                    # Replicate for batch size
+                    for _ in range(args.number_of_batches):
+                        S_list.append(S)
+                        # Create dummy values for unused outputs in pack-only mode
+                        log_probs_list.append(torch.zeros([1, L, 21], device=device))
+                        sampling_probs_list.append(torch.zeros([1, L, 21], device=device))
+                        decoding_order_list.append(torch.zeros([1, L], device=device))
+                        loss_list.append(torch.tensor([0.0], device=device))
+                        loss_per_residue_list.append(torch.zeros([1, L], device=device))
+                        loss_XY_list.append(torch.tensor([0.0], device=device))
+                    
+                    if args.verbose:
+                        print(f"Loaded {len(sequences)} sequence(s) from {fasta_path}")
+                        for i, seq in enumerate(sequences):
+                            unique_chains = sorted(list(set(chain_letters_list)))
+                            print(f"  Chain {unique_chains[i]}: {seq[:50]}{'...' if len(seq) > 50 else ''}")
+                
+                except Exception as e:
+                    print(f"ERROR processing {pdb}: {str(e)}")
+                    continue
+            
+            # Normal design mode
+            else:
+                for _ in range(args.number_of_batches):
+                    feature_dict["randn"] = torch.randn(
+                        [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+                        device=device,
+                    )
+                    output_dict = model.sample(feature_dict)
+
+                    # compute confidence scores
+                    loss, loss_per_residue = get_score(
+                        output_dict["S"],
+                        output_dict["log_probs"],
+                        feature_dict["mask"] * feature_dict["chain_mask"],
+                    )
+                    if args.model_type == "ligand_mpnn":
+                        combined_mask = (
+                            feature_dict["mask"]
+                            * feature_dict["mask_XY"]
+                            * feature_dict["chain_mask"]
+                        )
+                    else:
+                        combined_mask = feature_dict["mask"] * feature_dict["chain_mask"]
+                    loss_XY, _ = get_score(
+                        output_dict["S"], output_dict["log_probs"], combined_mask
+                    )
+                    # -----
+                    S_list.append(output_dict["S"])
+                    log_probs_list.append(output_dict["log_probs"])
+                    sampling_probs_list.append(output_dict["sampling_probs"])
+                    decoding_order_list.append(output_dict["decoding_order"])
+                    loss_list.append(loss)
+                    loss_per_residue_list.append(loss_per_residue)
+                    loss_XY_list.append(loss_XY)
+            
             S_stack = torch.cat(S_list, 0)
             log_probs_stack = torch.cat(log_probs_list, 0)
             sampling_probs_stack = torch.cat(sampling_probs_list, 0)
@@ -984,6 +1159,27 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="1-pack side chains using ligand context, 0 - do not use it.",
+    )
+
+    argparser.add_argument(
+        "--pack_only",
+        type=int,
+        default=0,
+        help="1 - pack side chains only without sequence design, 0 - run normal design workflow.",
+    )
+
+    argparser.add_argument(
+        "--input_sequences",
+        type=str,
+        default="",
+        help="Path to FASTA file containing sequences in chain order for pack-only mode.",
+    )
+
+    argparser.add_argument(
+        "--input_sequences_multi",
+        type=str,
+        default="",
+        help="Path to JSON mapping of {pdb_path: fasta_path} for batch pack-only mode.",
     )
 
     args = argparser.parse_args()

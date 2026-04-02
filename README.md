@@ -604,6 +604,82 @@ python run.py \
         --pack_with_ligand_context 0
 ```
 
+## Pack-Only Mode
+
+### Overview
+Pack-only mode allows you to provide custom sequences and pack side chains directly without running the sequence design step. This is useful for:
+- Repacking experimentally validated sequences
+- Testing different sequences on the same backbone
+- Bypassing the expensive design step when sequences are already known
+
+### Basic Usage
+
+#### Single PDB with one chain
+```bash
+python run.py \
+    --pack_only 1 \
+    --pdb_path "./inputs/1BC8.pdb" \
+    --input_sequences "./inputs/sequences.fasta" \
+    --out_folder "./outputs/pack_only" \
+    --number_of_packs_per_design 4 \
+    --seed 42
+```
+
+#### Multi-chain complex
+For multi-chain complexes, sequences are assigned to chains in **alphabetical order** (A→seq1, B→seq2, etc.).
+
+```bash
+# FASTA file with 2 sequences for chains A and B
+python run.py \
+    --pack_only 1 \
+    --pdb_path "./inputs/complex.pdb" \
+    --input_sequences "./inputs/sequences.fasta" \
+    --out_folder "./outputs/pack_only_multichain" \
+    --number_of_packs_per_design 4 \
+    --pack_with_ligand_context 1
+```
+
+#### Batch processing multiple PDBs
+```bash
+# Create JSON mapping: {pdb_path: fasta_path}
+cat > pdbs.json << 'EOF'
+{
+    "./inputs/protein1.pdb": "",
+    "./inputs/protein2.pdb": ""
+}
+EOF
+
+cat > sequences.json << 'EOF'
+{
+    "./inputs/protein1.pdb": "./seqs/protein1.fasta",
+    "./inputs/protein2.pdb": "./seqs/protein2.fasta"
+}
+EOF
+
+python run.py \
+    --pack_only 1 \
+    --pdb_path_multi pdbs.json \
+    --input_sequences_multi sequences.json \
+    --out_folder "./outputs/pack_only_batch" \
+    --number_of_packs_per_design 4
+```
+
+### FASTA Format
+Each sequence in the FASTA file corresponds to one chain (in alphabetical order):
+```
+>chain_A_description
+MKLLGIDSTQVNNAALSPEAKQIIYEKGTKVWVEPKSC
+>chain_B_description  
+ADVNQLIDSLKPEQVAAIDEARK
+```
+
+### Important Notes
+- Sequence count must match chain count in PDB (PDBs with mismatches are skipped with warning)
+- Sequence length must match chain length in PDB (validated before packing)
+- Only standard 20 amino acids are supported
+- `--pack_only` is incompatible with `--fixed_residues` and `--redesigned_residues`
+- Compatible with all existing packing options: `--pack_with_ligand_context`, `--number_of_packs_per_design`, `--sc_num_denoising_steps`, etc.
+
 ### Things to add
 - Support for ProteinMPNN CA-only model.
 - Examples for scoring sequences only.
