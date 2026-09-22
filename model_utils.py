@@ -6,6 +6,8 @@ import sys
 import numpy as np
 import torch
 
+from constraints import StepSchedule
+
 
 class ProteinMPNN(torch.nn.Module):
     def __init__(
@@ -260,6 +262,21 @@ class ProteinMPNN(torch.nn.Module):
             h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
             h_EXV_encoder_fw = mask_fw * h_EXV_encoder
 
+            # Optional deterministic constraints (see constraints.py). None by
+            # default, in which case the code below is untouched.
+            constraints = feature_dict.get("constraints", None)
+            active_constraints = (
+                constraints.start(
+                    StepSchedule.from_decoding_order(decoding_order),
+                    S_true,
+                    chain_mask,
+                    bias,
+                    temperature,
+                )
+                if constraints
+                else None
+            )
+
             for t_ in range(L):
                 t = decoding_order[:, t_]  # [B]
                 chain_mask_t = torch.gather(chain_mask, 1, t[:, None])[:, 0]  # [B]
@@ -313,7 +330,15 @@ class ProteinMPNN(torch.nn.Module):
                     t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
                 )[:, 0]
                 logits = self.W_out(h_V_t)  # [B,21]
+                # NOTE: log_probs is deliberately computed from the raw logits,
+                # so reported confidences stay comparable across constrained and
+                # unconstrained runs.
                 log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
+
+                if active_constraints is not None:
+                    bias_t = bias_t + active_constraints.logit_delta(
+                        t_, logits + bias_t
+                    )
 
                 probs = torch.nn.functional.softmax(
                     (logits + bias_t) / temperature, dim=-1
@@ -335,6 +360,8 @@ class ProteinMPNN(torch.nn.Module):
                 )
                 S_true_t = torch.gather(S_true, 1, t[:, None])[:, 0]
                 S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
+                if active_constraints is not None:
+                    active_constraints.commit(t_, S_t)
                 h_S.scatter_(
                     1,
                     t[:, None, None].repeat(1, 1, h_S.shape[-1]),
@@ -410,7 +437,25 @@ class ProteinMPNN(torch.nn.Module):
             h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
             h_EXV_encoder_fw = mask_fw * h_EXV_encoder
 
-            for t_list in new_decoding_order:
+            # Optional deterministic constraints (see constraints.py). Tied
+            # groups get one residue each, so a group that spans several
+            # in-scope positions counts with that multiplicity.
+            constraints = feature_dict.get("constraints", None)
+            active_constraints = (
+                constraints.start(
+                    StepSchedule.from_groups(
+                        new_decoding_order, B_decoder, device
+                    ),
+                    S_true,
+                    chain_mask,
+                    bias,
+                    temperature,
+                )
+                if constraints
+                else None
+            )
+
+            for k_step, t_list in enumerate(new_decoding_order):
                 total_logits = 0.0
                 for t in t_list:
                     chain_mask_t = chain_mask[:, t]  # [B]
@@ -443,6 +488,11 @@ class ProteinMPNN(torch.nn.Module):
                     ).float()  # [B,21]
                     total_logits += symmetry_weights[t] * logits
 
+                if active_constraints is not None:
+                    bias_t = bias_t + active_constraints.logit_delta(
+                        k_step, total_logits + bias_t
+                    )
+
                 probs = torch.nn.functional.softmax(
                     (total_logits + bias_t) / temperature, dim=-1
                 )  # [B,21]
@@ -459,6 +509,8 @@ class ProteinMPNN(torch.nn.Module):
                     S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
                     h_S[:, t] = self.W_s(S_t)
                     S[:, t] = S_t
+                if active_constraints is not None:
+                    active_constraints.commit(k_step, S_t)
 
             output_dict = {
                 "S": S,

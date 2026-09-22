@@ -21,6 +21,7 @@ from data_utils import (
     write_full_PDB,
 )
 import data_utils  # Ensure data_utils is available for the maps
+import constraints as cons
 from model_utils import ProteinMPNN
 from prody import writePDB
 from sc_utils import Packer, pack_side_chains, is_sequence_valid, cleanup_files
@@ -554,6 +555,94 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
+            # ---- deterministic decoding-time constraints ------------------ #
+            # The scope is the set of positions a property is computed over.
+            # "designed_chains" (the default) counts every position of any
+            # chain that has at least one designable residue, so fixed native
+            # residues inside those chains count toward the target -- which is
+            # what "this protein should have net charge -4" means.
+            chain_index_t = torch.tensor(
+                [
+                    sorted(set(chain_letters_list)).index(c)
+                    for c in chain_letters_list
+                ],
+                dtype=torch.long,
+                device=device,
+            )
+            designable_mask = feature_dict["chain_mask"][0] > 0
+            if args.constraint_scope == "designed_positions":
+                scope_mask = designable_mask.clone()
+            else:
+                designed_chain_letters = {
+                    c
+                    for c, d in zip(chain_letters_list, designable_mask.tolist())
+                    if d
+                }
+                scope_mask = torch.tensor(
+                    [c in designed_chain_letters for c in chain_letters_list],
+                    dtype=torch.bool,
+                    device=device,
+                )
+            constraint_terms = []
+            if args.target_charge is not None:
+                constraint_terms.append(
+                    cons.LinearFunctional(
+                        "net_charge",
+                        cons.CHARGE_WEIGHTS,
+                        args.target_charge,
+                        mode="eq",
+                        tolerance=args.charge_tolerance,
+                        lambda_max=args.constraint_lambda_max,
+                        unit="e",
+                    )
+                )
+            if args.min_extinction_280 is not None:
+                constraint_terms.append(
+                    cons.LinearFunctional(
+                        "e280",
+                        cons.EXTINCTION_280_WEIGHTS,
+                        args.min_extinction_280,
+                        mode="ge",
+                        lambda_max=args.constraint_lambda_max,
+                        unit="M-1cm-1",
+                    )
+                )
+            if args.spps_bias:
+                constraint_terms.append(cons.SPPSTerm(args.spps_bias))
+            constraint_set = (
+                cons.ConstraintSet(constraint_terms, scope_mask, chain_index_t)
+                if constraint_terms
+                else None
+            )
+            if constraint_set is not None:
+                feature_dict["constraints"] = constraint_set
+                if args.verbose:
+                    print(
+                        f"Constraints active ({args.constraint_scope}, "
+                        f"{int(scope_mask.sum())} residues in scope): "
+                        f"{constraint_set.describe()}"
+                    )
+            scope_idx = [i for i, s in enumerate(scope_mask.tolist()) if s]
+
+            # Only extend the FASTA header when asked, or when a constraint is
+            # active: with no new flags the output stays byte-identical to
+            # upstream.
+            report_properties = bool(args.report_properties) or (
+                constraint_set is not None
+            )
+
+            def constraint_report(full_seq):
+                """Measured property values for one design, for the header."""
+                if not report_properties:
+                    return ""
+                sub = "".join(full_seq[i] for i in scope_idx)
+                total, _ = cons.spps_risk(sub)
+                return (
+                    f", net_charge={cons.net_charge(sub):+g}"
+                    f", e280={cons.extinction_280(sub):.0f}"
+                    f", spps_risk={total:.2f}"
+                )
+
             sampling_probs_list = []
             log_probs_list = []
             decoding_order_list = []
@@ -646,6 +735,34 @@ def main(args) -> None:
             loss_XY_stack = torch.cat(loss_XY_list, 0)
             rec_mask = feature_dict["mask"][:1] * feature_dict["chain_mask"][:1]
             rec_stack = get_seq_rec(feature_dict["S"][:1], S_stack, rec_mask)
+
+            # Verify the guarantees on the sampled output rather than assuming
+            # them. Joint use of several hard constraints can in principle
+            # over-restrict a position; this is where that would show up.
+            if constraint_set is not None:
+                violations = []
+                for _row in S_stack.cpu().numpy():
+                    _sub = "".join(restype_int_to_str[a] for a in _row[scope_idx])
+                    for _term in constraint_terms:
+                        if not isinstance(_term, cons.LinearFunctional):
+                            continue
+                        _got = float((_term.values.cpu().numpy()[_row[scope_idx]]).sum())
+                        if _term.mode == "eq" and abs(_got - _term.target) > _term.tolerance + 1e-6:
+                            violations.append((_term.name, _term.target, _got))
+                        elif _term.mode == "ge" and _got < _term.target - 1e-6:
+                            violations.append((_term.name, _term.target, _got))
+                if violations:
+                    print(
+                        f"WARNING: {len(violations)} constraint violation(s) in the "
+                        f"sampled designs for {name}; first: {violations[0]}. "
+                        f"This can happen when several hard constraints compete "
+                        f"for the same position."
+                    )
+                elif args.verbose:
+                    print(
+                        f"All hard constraints satisfied in {S_stack.shape[0]} "
+                        f"design(s)."
+                    )
 
             native_seq = "".join(
                 [restype_int_to_str[AA] for AA in feature_dict["S"][0].cpu().numpy()]
@@ -1057,7 +1174,7 @@ def main(args) -> None:
 
                         if is_last_entry_in_fasta:
                             f.write(
-                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}{}\n{}".format(
                                     name,
                                     ix_suffix,
                                     args.temperature,
@@ -1065,12 +1182,13 @@ def main(args) -> None:
                                     loss_np,
                                     loss_XY_np,
                                     seq_rec_print,
+                                    constraint_report(seq),
                                     seq_out_str_for_this_entry,
                                 )
                             )
                         else:
                             f.write(
-                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
+                                ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}{}\n{}\n".format(
                                     name,
                                     ix_suffix,
                                     args.temperature,
@@ -1078,6 +1196,7 @@ def main(args) -> None:
                                     loss_np,
                                     loss_XY_np,
                                     seq_rec_print,
+                                    constraint_report(seq),
                                     seq_out_str_for_this_entry,
                                 )
                             )
@@ -1439,6 +1558,68 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Path to JSON mapping of {pdb_path: fasta_path} for batch pack-only mode.",
+    )
+
+    # ---- deterministic decoding-time constraints --------------------------- #
+    argparser.add_argument(
+        "--target_charge",
+        type=float,
+        default=None,
+        help="Net charge the designed sequence must have, e.g. -4. Asp/Glu count "
+        "-1, Lys/Arg +1, His is treated as neutral and free termini are not "
+        "counted. Achieved exactly unless --charge_tolerance is set. Works with "
+        "every --model_type.",
+    )
+    argparser.add_argument(
+        "--charge_tolerance",
+        type=float,
+        default=0.0,
+        help="Allowed deviation from --target_charge. 0 (default) means exact.",
+    )
+    argparser.add_argument(
+        "--min_extinction_280",
+        type=float,
+        default=None,
+        help="Minimum molar extinction coefficient at 280 nm in M^-1 cm^-1, so "
+        "the design can be quantified by A280. Computed as 5500 per Trp + 1490 "
+        "per Tyr (Pace et al. 1995, all Cys reduced); 5500 therefore guarantees "
+        "at least one Trp, 1490 at least one Trp or Tyr.",
+    )
+    argparser.add_argument(
+        "--spps_bias",
+        type=float,
+        default=0.0,
+        help="Strength of the Fmoc-SPPS synthesis-risk penalty (0 off, 0.5 "
+        "gentle, 1.0 a reasonable default, 2.0 synthesis strongly prioritised). "
+        "Penalises Asp-Gly and other aspartimide-prone Asp-X motifs, "
+        "beta-branched runs, hydrophobic windows, Cys and Met. This one steers "
+        "and does not guarantee: MPNN decodes in random order, so only "
+        "already-decoded neighbours are visible when a position is decided.",
+    )
+    argparser.add_argument(
+        "--constraint_scope",
+        type=str,
+        default="designed_chains",
+        choices=["designed_chains", "designed_positions"],
+        help="Which residues a property is computed over. 'designed_chains' "
+        "(default) uses every residue of any chain containing a designable "
+        "position, so fixed native residues count toward the target. "
+        "'designed_positions' uses only the redesigned positions.",
+    )
+    argparser.add_argument(
+        "--constraint_lambda_max",
+        type=float,
+        default=8.0,
+        help="Cap on the soft-steering multiplier in logit units. The hard "
+        "reachability mask, not this cap, is what enforces the target.",
+    )
+    argparser.add_argument(
+        "--report_properties",
+        type=int,
+        default=0,
+        help="1 - add measured net_charge, e280 and spps_risk to the FASTA "
+        "headers even when no constraint is active, for baseline comparisons. "
+        "Reporting is automatic whenever a constraint is active.",
     )
 
     args = argparser.parse_args()
