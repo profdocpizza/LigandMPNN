@@ -37,11 +37,15 @@ Two kinds of constraint are provided.
     It steers, it does not guarantee.
 
 Method context: the soft-steering-plus-lookahead-pruning combination is the
-protein-design analogue of constrained text decoding (Lu et al., NeuroLogic,
-NAACL 2021; NeuroLogic A*esque, NAACL 2022), where future-constraint-
-satisfaction estimates guide an autoregressive decoder.  CAPE-Beam (Gasser et
-al., Comput Struct Biotechnol J 2025) previously applied constrained decoding
-to ProteinMPNN for MHC-I immune visibility.
+protein-design analogue of constrained text decoding -- see "NeuroLogic
+A*esque Decoding: Constrained Text Generation with Lookahead Heuristics" (Lu
+et al., NAACL 2022, aclanthology.org/2022.naacl-main.57) and the earlier
+"NeuroLogic Decoding: (Un)supervised Neural Text Generation with Predicate
+Logic Constraints", where future-constraint-satisfaction estimates guide an
+autoregressive decoder.  Constrained decoding has been applied to ProteinMPNN
+before, for MHC class I immune visibility: "A novel decoding strategy for
+ProteinMPNN to design with less visibility to cytotoxic T-lymphocytes"
+(Comput Struct Biotechnol J 2025, doi:10.1016/j.csbj.2025.07.055).
 """
 
 from __future__ import annotations

@@ -78,14 +78,16 @@ neighbours of the position being decided do not exist yet, so the penalty sees
 partial context and acts greedily. Hence: no guarantee.
 
 The accurate name for this is **constrained decoding**. It is the protein-design
-analogue of constrained text generation — NeuroLogic ([Lu et al., NAACL
-2021](https://aclanthology.org/2021.naacl-main.339/)) and NeuroLogic A*esque
-([Lu et al., NAACL 2022](https://aclanthology.org/2022.naacl-main.57/)), where
-lookahead estimates of future constraint satisfaction guide an autoregressive
-decoder. Applying constrained decoding to ProteinMPNN is not new: CAPE-Beam
-([Gasser et al., Comput Struct Biotechnol J
-2025](https://doi.org/10.1016/j.csbj.2025.07.055)) restricts designs to kmers
-predicted not to be presented to cytotoxic T-lymphocytes. What is added here is
+analogue of constrained text generation — "NeuroLogic Decoding: (Un)supervised
+Neural Text Generation with Predicate Logic Constraints" and its successor
+["NeuroLogic A*esque Decoding: Constrained Text Generation with Lookahead
+Heuristics"](https://aclanthology.org/2022.naacl-main.57/) (Lu et al., NAACL
+2022), where lookahead estimates of future constraint satisfaction guide an
+autoregressive decoder. Applying constrained decoding to ProteinMPNN is not
+new either: ["A novel decoding strategy for ProteinMPNN to design with less
+visibility to cytotoxic T-lymphocytes"](https://doi.org/10.1016/j.csbj.2025.07.055)
+(Computational and Structural Biotechnology Journal, 2025) steers designs away
+from peptides predicted to be presented by MHC class I. What is added here is
 the constraint set and the exactness.
 
 ### Non-destructive by construction
