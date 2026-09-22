@@ -50,6 +50,7 @@ def run_design(
     temperature=0.1,
     extra_args=(),
     out_folder=None,
+    allow_failure=False,
 ):
     """Run one ``run.py`` invocation and return parsed designs.
 
@@ -90,6 +91,14 @@ def run_design(
     stem = os.path.splitext(os.path.basename(pdb_path))[0]
     fasta = os.path.join(tmp, "seqs", f"{stem}.fa")
     if not os.path.exists(fasta):
+        if allow_failure:
+            return {
+                "native": None,
+                "designs": [],
+                "stderr": proc.stderr,
+                "stdout": proc.stdout,
+                "returncode": proc.returncode,
+            }
         raise RuntimeError(
             f"run.py produced no FASTA (exit {proc.returncode}).\n"
             f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
@@ -124,7 +133,13 @@ def run_design(
                 "spps_risk": float(fields["spps_risk"]),
             }
         )
-    return {"native": native, "designs": designs, "stderr": proc.stderr}
+    return {
+        "native": native,
+        "designs": designs,
+        "stderr": proc.stderr,
+        "stdout": proc.stdout,
+        "returncode": proc.returncode,
+    }
 
 
 def composition(seqs):

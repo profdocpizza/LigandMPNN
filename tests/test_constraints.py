@@ -204,26 +204,51 @@ def test_unreachable_target_raises():
             raise AssertionError(f"target {target} should be unreachable at L=60")
 
 
+def test_symmetric_charge_lattice_raises_instead_of_silent_miss():
+    """Tied groups must reject charge values outside their discrete lattice."""
+    cs = ConstraintSet(
+        [LinearFunctional("charge", CHARGE_WEIGHTS, 1, "eq")],
+        torch.ones(6, dtype=torch.bool),
+        torch.zeros(6, dtype=torch.long),
+    )
+    order = StepSchedule.from_groups([[0, 1, 2], [3, 4, 5]], 2, "cpu")
+    try:
+        cs.start(
+            order,
+            torch.zeros(2, 6, dtype=torch.long),
+            torch.ones(2, 6),
+            torch.zeros(2, 6, 21),
+            0.1,
+        )
+    except InfeasibleConstraint as exc:
+        assert "discrete reachable values" in str(exc)
+    else:
+        raise AssertionError("charge +1 should be unreachable with groups of 3")
+
+
 def test_omitting_all_neutral_residues_is_flagged():
-    """The interval relaxation is not tight without a zero-valued residue."""
+    """Discrete charge reachability rejects an odd target without neutrals."""
     neutral = [aa for aa in ALPHABET[:20] if CHARGE_WEIGHTS.get(aa, 0.0) == 0.0]
     cs = ConstraintSet(
-        [LinearFunctional("charge", CHARGE_WEIGHTS, 0.0, "eq")],
+        [LinearFunctional("charge", CHARGE_WEIGHTS, 1.0, "eq")],
         torch.ones(8, dtype=torch.bool),
         torch.zeros(8, dtype=torch.long),
     )
     bias = torch.zeros(1, 8, 21)
     for aa in neutral:
         bias[0, :, ALPHABET.index(aa)] = -1e8
-    order = torch.arange(8).unsqueeze(0)
-    ac = cs.start(
-        StepSchedule.from_decoding_order(order),
-        torch.zeros(1, 8, dtype=torch.long),
-        torch.ones(1, 8),
-        bias,
-        0.1,
-    )
-    assert ac.warnings and "zero-valued residue" in ac.warnings[0]
+    try:
+        cs.start(
+            StepSchedule.from_decoding_order(torch.arange(8).unsqueeze(0)),
+            torch.zeros(1, 8, dtype=torch.long),
+            torch.ones(1, 8),
+            bias,
+            0.1,
+        )
+    except InfeasibleConstraint as exc:
+        assert "discrete reachable values" in str(exc)
+    else:
+        raise AssertionError("odd charge should be unreachable without neutrals")
 
 
 # --------------------------------------------------------------------------- #

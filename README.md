@@ -167,11 +167,10 @@ reliably suppress on-resin aggregation.
 ### What is not claimed
 
 - **No structural validation.** Nothing here was folded, and no design was
-  expressed, synthesised or measured. The reported cost is the model's own
-  negative log-likelihood and sequence recovery — a standard cheap proxy, not
-  evidence that a design folds. A self-consistency check (fold the designs,
-  measure RMSD to the input backbone) is the obvious next step and has not been
-  done.
+  expressed, synthesised or measured. The composition and sequence metrics
+  shown here demonstrate what residues the constraint changes, not whether a
+  design folds. A self-consistency check (fold the designs, measure RMSD to the
+  input backbone) is the obvious next step and has not been done.
 - **The charge convention is not a pI or a titration model.** If you need pI or
   pH-dependent charge, compute it from the output sequence with a proper tool.
 - **The SPPS term is untested against real synthesis.** It encodes literature
@@ -182,19 +181,20 @@ reliably suppress on-resin aggregation.
   position. `run.py` verifies every sampled design against every hard
   constraint and prints a warning if any missed; no violation was observed in
   any benchmark run.
-- **Exactness assumes a zero-valued residue remains available.** The
-  reachability mask treats reachable values as a contiguous interval, which for
-  an equality target is sound as long as every remaining designable position
-  can still take a charge-neutral residue. With the standard 20-letter alphabet
-  that always holds. If `--omit_AA` removes every neutral residue somewhere, the
-  run warns.
+- **Discrete reachability matters for equality constraints.** Integer-valued
+  equality targets, including tied symmetry groups and omitted residues, are
+  checked against their discrete reachable set. If a target is impossible, the
+  run raises an `InfeasibleConstraint` with the reachable interval rather than
+  silently returning a miss. Non-integer equality functionals still use the
+  interval fallback.
 
 ### Benchmarks
 
 Reproduce with:
 
 ```bash
-python benchmarks/bench_charge.py       # ~25 min, 39 runs
+python benchmarks/fetch_panel.py       # downloads the panel only when missing
+python benchmarks/bench_charge.py       # charge sweep plus 0/+-4 tolerance arms
 python benchmarks/bench_extinction.py   # ~3 min
 python benchmarks/bench_spps.py         # ~8 min
 python benchmarks/make_figures.py       # needs pandas + matplotlib only
@@ -214,31 +214,26 @@ exactly.** Left to itself the model produces about −5 e on this backbone
 (native ubiquitin is 0 e), so most of this range is a long way from what it
 would choose.
 
-The cost is real and worth seeing. Mean per-residue NLL rises from 0.79
-unconstrained to 1.25 at a target of 0 e and 1.91 at +30 e. The curve is
-lowest at net zero for all three models and rises monotonically toward both
-extremes — note that its minimum is *not* at the unconstrained mean of about
-−5 e. Even requesting the charge the model already prefers on average costs
-~0.5 nats, because pinning every design to a single integer removes the spread
-the model produces naturally.
-`--charge_tolerance` buys that back — at target −5 e, ±0 gives NLL 1.31 and a
-single achieved value, while ±8 gives NLL 1.01 and a spread of 9 e, with every
-design still inside the requested window.
+The composition panel uses target −5 e, near the unconstrained mean. The
+requested shift is visible primarily in D/E/K/R, while the other residues move
+less. The tolerance panel reports the mean absolute frequency change separately
+for D/E/K/R and the other 16 residues, rather than treating MPNN's own NLL as a
+biophysical quality score.
 
 #### 2. ε₂₈₀, on the villin headpiece (1VII, 36 aa, SolubleMPNN)
 
 ![extinction benchmark](benchmarks/figures/extinction_benchmark.png)
 
-This target was chosen by measurement, not assumption. Native HP36 has exactly
-one Trp, but across 64 unconstrained SolubleMPNN designs **not one contained a
-Trp** (mean ε₂₈₀ = 1583 M⁻¹cm⁻¹, i.e. about one Tyr). A design set like that
-cannot be quantified by A280.
+The updated benchmark uses four backbones, three model types, and 50 designs
+per threshold. The composition comparison uses 1VII with SolubleMPNN. Native
+HP36 has exactly one Trp, but unconstrained designs can be low in ε₂₈₀; a set
+without a chromophore cannot be quantified by A280.
 
-With `--min_extinction_280 5500`, 64/64 designs meet the floor and the mean Trp
-count is exactly 1.00 — it installs the chromophore it was asked for and not
-more. The rest of the distribution barely moves: mean Tyr goes 1.06 → 1.16 and
-the Jensen-Shannon divergence of the full 20-residue composition against the
-unconstrained arm is 0.015 bits. NLL cost is 0.96 → 1.10.
+The swarm shows the final ε₂₈₀ values for requests off, 0, 1000, 2000, 4000,
+8000 and 16000. Every constrained design meets its requested floor. The
+composition panel shows that the largest change is the required Trp/Tyr usage;
+the other residues move much less on the selected 1VII comparison. This is a
+sequence-level composition result, not evidence that the designs fold.
 
 #### 3. SPPS risk, on two targets
 
@@ -255,13 +250,13 @@ aspartimide motifs actually appear. Asp-Gly is present in 14.1 % of
 unconstrained designs, 7.8 % at bias 0.5, and **0 % from bias 1.0 upward**;
 β-branched residues fall from 17.7 to 7.0 per design at bias 1.0.
 
-The trade-off is the honest part of this benchmark. On 1PGA, NLL goes 0.89 →
-1.08 and sequence recovery 0.56 → 0.47 at bias 1.0. GB1's native sequence
-scores 54.2 on this risk scale — essentially the same as the unconstrained
-designs — because its β-sheet core genuinely is β-branched-rich. Driving the
-risk to zero means removing the residues that build that sheet. `--spps_bias`
-is a dial on a real trade-off, not a free improvement; 0.5–1.0 is where it
-removes the classic motifs at a modest cost.
+The composition panel makes the trade-off explicit without using model NLL.
+GB1's native sequence scores 54.2 on this risk scale — essentially the same as
+the unconstrained designs — because its β-sheet core genuinely is
+β-branched-rich. Driving the risk to zero means removing the residues that
+build that sheet. `--spps_bias` is a dial on a real trade-off, not a free
+improvement; 0.5–1.0 is where it removes the classic motifs while keeping the
+composition shift smaller than at extreme bias.
 
 ---
 

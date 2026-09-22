@@ -1,14 +1,8 @@
-"""Benchmark 2: does --min_extinction_280 install a 280 nm chromophore, and
-what else does it change?
+"""Benchmark 2: final epsilon-280 values and composition changes.
 
-Target: the villin headpiece subdomain HP36 (PDB 1VII, 36 residues), a small
-folded three-helix peptide whose native sequence carries exactly one Trp.
-The model is SolubleMPNN, which was chosen because it is reluctant to place
-Trp here -- see the measured baseline in the output.
-
-The test is two-sided.  The flag should (a) always reach the requested
-extinction coefficient and (b) leave the rest of the amino-acid distribution
-largely alone, rather than dragging the whole design toward aromatics.
+The first output covers several backbones and all three standard MPNN models.
+The second output keeps one backbone/model fixed and compares 50 designs with
+and without an 8000 M^-1 cm^-1 floor.
 
 Writes benchmarks/results/extinction.csv and extinction_composition.csv.
 """
@@ -19,91 +13,102 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bench_lib import (
-    AA20,
-    STRUCTURES,
-    composition,
-    extinction_280,
-    jensen_shannon,
-    mean,
-    run_design,
-)
+from bench_lib import AA20, STRUCTURES, extinction_280, mean, run_design
 
-# 1490 = one Tyr; 5500 = one Trp; 11000 = two Trp equivalents.
-THRESHOLDS = [None, 1490.0, 5500.0, 11000.0]
-MODEL = "soluble_mpnn"
-N_DESIGNS = 64
+THRESHOLDS = [None, 0.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0]
+MODELS = ["protein_mpnn", "soluble_mpnn", "ligand_mpnn"]
+PANEL = ["1L2Y", "1PGA", "1UBQ", "1VII"]
+COMPOSITION_BACKBONE = "1VII"
+COMPOSITION_MODEL = "soluble_mpnn"
+N_DESIGNS = 50
 SEED = 2024
-PDB = os.path.join(STRUCTURES, "1VII.pdb")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
 
 def main():
     os.makedirs(OUT, exist_ok=True)
     rows, comp_rows = [], []
-    baseline_comp = None
 
-    for thr in THRESHOLDS:
-        extra = [] if thr is None else ["--min_extinction_280", thr]
-        res = run_design(
-            PDB, MODEL, batch_size=N_DESIGNS, n_batches=1, seed=SEED, extra_args=extra
-        )
-        designs = res["designs"]
-        seqs = [d["sequence"] for d in designs]
-        label = "unconstrained" if thr is None else f"{thr:.0f}"
-        comp = composition(seqs)
-        if thr is None:
-            baseline_comp = comp
-
-        ref = thr if thr is not None else 5500.0
-        met = sum(1 for d in designs if d["e280"] >= ref) / len(designs)
-        for i, d in enumerate(designs):
-            rows.append(
-                {
-                    "threshold": label,
-                    "threshold_value": 0.0 if thr is None else thr,
-                    "design": i,
-                    "e280": d["e280"],
-                    "n_trp": d["sequence"].count("W"),
-                    "n_tyr": d["sequence"].count("Y"),
-                    "meets_threshold": int(d["e280"] >= ref),
-                    "nll": d["nll"],
-                    "seq_rec": d["seq_rec"],
-                    "charge": d["charge"],
-                    "spps_risk": d["spps_risk"],
-                    "sequence": d["sequence"],
+    for stem in PANEL:
+        pdb = os.path.join(STRUCTURES, f"{stem}.pdb")
+        for model in MODELS:
+            baseline_comp = None
+            for threshold in THRESHOLDS:
+                extra = [] if threshold is None else [
+                    "--min_extinction_280",
+                    threshold,
+                ]
+                result = run_design(
+                    pdb,
+                    model,
+                    batch_size=N_DESIGNS,
+                    n_batches=1,
+                    seed=SEED,
+                    extra_args=extra,
+                )
+                designs = result["designs"]
+                sequences = [d["sequence"] for d in designs]
+                label = "off" if threshold is None else f"{threshold:.0f}"
+                composition = {
+                    aa: sum(seq.count(aa) for seq in sequences)
+                    / sum(len(seq) for seq in sequences)
+                    for aa in AA20
                 }
+                if threshold is None:
+                    baseline_comp = composition
+                required = threshold if threshold is not None else 0.0
+                for index, design in enumerate(designs):
+                    rows.append(
+                        {
+                            "backbone": stem,
+                            "model": model,
+                            "threshold": label,
+                            "threshold_value": required,
+                            "design": index,
+                            "e280": design["e280"],
+                            "n_trp": sequences[index].count("W"),
+                            "n_tyr": sequences[index].count("Y"),
+                            "meets_threshold": int(design["e280"] >= required),
+                            "seq_rec": design["seq_rec"],
+                            "charge": design["charge"],
+                            "spps_risk": design["spps_risk"],
+                            "sequence": design["sequence"],
+                        }
+                    )
+                for aa in AA20:
+                    comp_rows.append(
+                        {
+                            "backbone": stem,
+                            "model": model,
+                            "threshold": label,
+                            "aa": aa,
+                            "frequency": composition[aa],
+                            "baseline_frequency": baseline_comp[aa],
+                        }
+                    )
+                print(
+                    f"[{stem} {model} {label:>5}] "
+                    f"mean e280 {mean(d['e280'] for d in designs):8.0f}  "
+                    f"range {min(d['e280'] for d in designs):.0f}.."
+                    f"{max(d['e280'] for d in designs):.0f}  "
+                    f"meets {sum(d['e280'] >= required for d in designs)}/{len(designs)}",
+                    flush=True,
+                )
+            print(
+                f"native {stem} {model} e280 = "
+                f"{extinction_280(result['native']):.0f}",
+                flush=True,
             )
-        js = jensen_shannon(comp, baseline_comp)
-        for aa in AA20:
-            comp_rows.append(
-                {
-                    "threshold": label,
-                    "aa": aa,
-                    "frequency": comp[aa],
-                    "baseline_frequency": baseline_comp[aa],
-                }
-            )
-        print(
-            f"[{label:>13}] meets>={ref:.0f}: {met:6.1%}  "
-            f"mean e280 {mean(d['e280'] for d in designs):8.0f}  "
-            f"mean Trp {mean(s.count('W') for s in seqs):.2f}  "
-            f"mean Tyr {mean(s.count('Y') for s in seqs):.2f}  "
-            f"NLL {mean(d['nll'] for d in designs):.4f}  "
-            f"JS vs baseline {js:.4f} bits",
-            flush=True,
-        )
 
     with open(os.path.join(OUT, "extinction.csv"), "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
     with open(os.path.join(OUT, "extinction_composition.csv"), "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(comp_rows[0]))
-        w.writeheader()
-        w.writerows(comp_rows)
-    print(f"\nwrote {len(rows)} design rows")
-    print(f"native 1VII e280 = {extinction_280(res['native']):.0f}")
+        writer = csv.DictWriter(fh, fieldnames=list(comp_rows[0]), lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(comp_rows)
+    print(f"wrote {len(rows)} design rows and {len(comp_rows)} composition rows")
 
 
 if __name__ == "__main__":

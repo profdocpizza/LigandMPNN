@@ -368,10 +368,83 @@ class _LinearState:
         self.suf_max = suffix(dmax)
         self.suf_fixed = suffix(self.fixed_contrib)
         self.suf_ndes = suffix(self.n_designable)
+        # Variance of a tied group of g positions scales as g^2, not g, so the
+        # lookahead needs the sum of squared multiplicities as well.
+        self.suf_ndes2 = suffix(self.n_designable**2)
+
+        # Running estimate of the model's own per-position value moments, used
+        # to predict what the undecoded positions can still supply. Updated
+        # from the unbiased marginals at each step, so it costs nothing extra.
+        self._m_sum = torch.zeros(B, device=device)
+        self._var_sum = torch.zeros(B, device=device)
+        self._n_obs = torch.zeros(B, device=device)
 
         self.accum = torch.zeros(B, device=device)
         self.feasible_at_start = self._window_overlaps(
             self.suf_min[:, 0], self.suf_max[:, 0]
+        )
+        self._init_exact_reachability()
+
+    def _init_exact_reachability(self) -> None:
+        """Build exact integer reachability for equality constraints.
+
+        The interval relaxation is sufficient for ordinary singleton steps,
+        but tied groups can restrict a charge to a lattice (for example, all
+        groups of three can only change charge in multiples of three).  Keep a
+        small suffix dynamic-programming table for integer-valued functionals
+        so the hard mask cannot silently choose a value outside that lattice.
+        """
+        self.exact_reachability = None
+        self.exact_targets = None
+        if self.cfg.mode != "eq":
+            return
+        values = [float(v) for v in self.v[:N_AA].detach().cpu().tolist()]
+        if not all(abs(v - round(v)) < 1e-6 for v in values):
+            return
+        if abs(self.cfg.target - round(self.cfg.target)) >= 1e-6:
+            return
+        target_lo = math.ceil(self.cfg.target - self.cfg.tolerance - 1e-6)
+        target_hi = math.floor(self.cfg.target + self.cfg.tolerance + 1e-6)
+        self.exact_targets = (target_lo, target_hi)
+        values = [int(round(v)) for v in values]
+        suffixes = []
+        for b in range(self.schedule.B):
+            row = [set() for _ in range(self.schedule.K + 1)]
+            row[-1].add(0)
+            for k in range(self.schedule.K - 1, -1, -1):
+                if bool(self.step_designable[b, k]):
+                    mult = int(round(float(self.mult[b, k])))
+                    choices = [
+                        mult * values[a]
+                        for a in range(N_AA)
+                        if bool(self.allowed[b, k, a])
+                    ]
+                else:
+                    native = int(round(float(self.fixed_contrib[b, k])))
+                    choices = [native]
+                row[k] = {choice + rest for choice in choices for rest in row[k + 1]}
+            suffixes.append(row)
+        self.exact_reachability = suffixes
+
+    def exact_feasible_at_start(self) -> bool:
+        if self.exact_reachability is None:
+            return True
+        lo, hi = self.exact_targets
+        return all(
+            any(lo <= value <= hi for value in suffixes[0])
+            for suffixes in self.exact_reachability
+        )
+
+    def _exact_candidate_ok(self, b: int, k: int, aa: int) -> bool:
+        if self.exact_reachability is None:
+            return True
+        lo, hi = self.exact_targets
+        current = int(round(float(self.accum[b])))
+        mult = int(round(float(self.mult[b, k])))
+        contribution = mult * int(round(float(self.v[aa])))
+        return any(
+            lo <= current + contribution + rest <= hi
+            for rest in self.exact_reachability[b][k + 1]
         )
 
     # -- feasibility -------------------------------------------------------- #
@@ -386,17 +459,14 @@ class _LinearState:
         return lo <= cfg.target
 
     def exactness_caveats(self) -> List[str]:
-        """Conditions under which the reachable interval is not tight.
+        """Conditions under which the interval fallback is not tight.
 
-        The mask treats the set of values reachable from the remaining steps as
-        a contiguous interval.  For an equality target that is only sound if
-        every remaining designable step can also take an intermediate value --
-        in practice, if it can take a residue of value zero.  With the standard
-        20-letter alphabet that always holds; it can fail if
-        ``--omit_AA``/``--omit_AA_per_residue`` removes every zero-valued
-        residue somewhere.
+        Integer-valued equality constraints use an exact suffix set above. The
+        warning remains for non-integer equality functionals, where the hard
+        mask still uses a contiguous interval and omitting every zero-valued
+        residue can make that relaxation non-tight.
         """
-        if self.cfg.mode != "eq":
+        if self.cfg.mode != "eq" or self.exact_reachability is not None:
             return []
         zero_ok = (self.v[:N_AA].abs() < 1e-12).unsqueeze(0).unsqueeze(0) & self.allowed
         bad = self.step_designable & (self.mult > 0) & (~zero_ok.any(-1))
@@ -415,8 +485,9 @@ class _LinearState:
         """Additive logit term for step ``k``.
 
         ``base`` is ``[B, 21]``, the logits plus any bias already applied.  The
-        return value is added to the bias, so it must not be scaled by
-        temperature here.
+        return value is added to the bias and the sum is then divided by the
+        temperature, so a log-probability correction must be multiplied by the
+        temperature here to act as a proper likelihood reweighting.
         """
         B = base.shape[0]
         out = torch.zeros_like(base)
@@ -425,34 +496,18 @@ class _LinearState:
             return out
 
         mult = self.mult[:, k]
-        # What the designable steps from k onward still have to supply, as a
-        # per-position band. Steering is a deadband controller on this band:
-        # while the model's own expectation already lies inside it, the logits
-        # are left alone. With tolerance 0 the band collapses to a point and
-        # the behaviour is pure target-tracking.
-        n_rem = self.suf_ndes[:, k].clamp(min=1.0)
-        remaining = self.accum + self.suf_fixed[:, k]
-        inf = torch.full_like(remaining, float("inf"))
-        if self.cfg.mode == "eq":
-            want_lo = (self.cfg.target - self.cfg.tolerance - remaining) / n_rem
-            want_hi = (self.cfg.target + self.cfg.tolerance - remaining) / n_rem
-        elif self.cfg.mode == "ge":
-            want_lo = (self.cfg.target - remaining) / n_rem
-            want_hi = inf
-        else:
-            want_lo = -inf
-            want_hi = (self.cfg.target - remaining) / n_rem
-
-        lam = self._solve_lambda(
-            base, want_lo / self.cfg.scale, want_hi / self.cfg.scale, active
-        )
-        out = out + lam.unsqueeze(-1) * self.v_norm.unsqueeze(0)
+        out = out + self._lookahead(k, base, mult, active)
 
         # Hard reachability mask, applied last so nothing can override it.
         contrib = mult.unsqueeze(-1) * self.v.unsqueeze(0)  # [B,21]
         lo = (self.accum + self.suf_min[:, k + 1]).unsqueeze(-1) + contrib
         hi = (self.accum + self.suf_max[:, k + 1]).unsqueeze(-1) + contrib
         ok = self._window_overlaps(lo, hi)
+        if self.exact_reachability is not None:
+            for b in range(B):
+                if bool(active[b]):
+                    for aa in range(N_AA):
+                        ok[b, aa] = ok[b, aa] and self._exact_candidate_ok(b, k, aa)
         ok = ok & torch.cat(
             [self.allowed[:, k], torch.zeros(B, 1, dtype=torch.bool, device=base.device)],
             dim=-1,
@@ -464,51 +519,84 @@ class _LinearState:
         out = out + torch.where(keep.unsqueeze(-1), mask, torch.zeros_like(mask))
         return torch.where(active.unsqueeze(-1), out, torch.zeros_like(out))
 
-    def _solve_lambda(
+    def _lookahead(
         self,
+        k: int,
         base: torch.Tensor,
-        want_lo: torch.Tensor,
-        want_hi: torch.Tensor,
+        mult: torch.Tensor,
         active: torch.Tensor,
     ) -> torch.Tensor:
-        """Bisect for the ``lam`` that brings ``E_lam[v_norm]`` into the band.
+        """Reweight this step's logits by the chance of still hitting the target.
 
-        ``E_lam`` is strictly increasing in ``lam`` (its derivative is the
-        variance of ``v_norm`` under the tilted distribution divided by the
-        temperature), so bisection is unconditionally safe.  Where the
-        untilted expectation already lies within ``[want_lo, want_hi]`` the
-        multiplier is zero and the model's own preference is left untouched --
-        this is what makes a tolerance actually cheaper than an exact target
-        rather than only a wider guarantee.
+        The exact conditional distribution is
+        ``p(s_t | s_<t, target) = p(s_t | s_<t) * P(target | s_<=t) / Z``.  The
+        second factor is the probability that the positions *after* this one
+        can still make up whatever the target demands.  Multiplying by it
+        constrains only the endpoint, which is what was actually asked for.
+
+        The earlier controller instead solved for a multiplier that forced
+        each step's *expected* contribution to match the outstanding
+        per-position requirement.  That pins the whole trajectory rather than
+        the endpoint, and measured against rejection sampling it cost roughly
+        0.5 nats per residue on ubiquitin even for targets the model would
+        have hit on its own.
+
+        ``P`` is estimated by a normal approximation to the sum over the
+        remaining positions, whose per-position mean and variance are read off
+        the model's own unbiased marginals as decoding proceeds.  The sum of
+        many near-independent bounded terms is close to normal, and only
+        differences across the 20 candidates matter, so the approximation is
+        mild.  Nothing here affects correctness: the hard reachability mask
+        applied afterwards is what guarantees the target is met.
         """
-        cfg = self.cfg
-        logits = base[:, :N_AA]
-        v = self.v_norm[:N_AA].unsqueeze(0)
-        vmin = float(self.v_norm[:N_AA].min())
-        vmax = float(self.v_norm[:N_AA].max())
+        v = self.v[:N_AA].unsqueeze(0)  # [1,20] in natural units
+        eps = 1e-8
 
-        def expectation(lam: torch.Tensor) -> torch.Tensor:
-            p = torch.softmax((logits + lam.unsqueeze(-1) * v) / self.temperature, -1)
-            return (p * v).sum(-1)
+        # Model's own marginal at this step, at the sampling temperature.
+        p = torch.softmax(base[:, :N_AA] / self.temperature, dim=-1)
+        m_t = (p * v).sum(-1)
+        var_t = (p * v * v).sum(-1) - m_t**2
+        upd = active.float()
+        self._m_sum = self._m_sum + upd * m_t
+        self._var_sum = self._var_sum + upd * var_t.clamp(min=0.0)
+        self._n_obs = self._n_obs + upd
+        n_obs = self._n_obs.clamp(min=1.0)
+        m_hat = self._m_sum / n_obs
+        var_hat = (self._var_sum / n_obs).clamp(min=eps)
 
-        e0 = expectation(torch.zeros_like(want_lo))
-        below = e0 < want_lo
-        above = e0 > want_hi
-        skip = ~(below | above)
-        # Aim at the nearer edge of the band, never past it.
-        want = torch.where(below, want_lo, torch.where(above, want_hi, e0))
-        want = want.clamp(min=vmin, max=vmax)
+        # What the positions after this one would have to supply, per candidate.
+        n_rem = self.suf_ndes[:, k + 1]
+        n2_rem = self.suf_ndes2[:, k + 1]
+        deficit = self.cfg.target - self.accum - self.suf_fixed[:, k + 1]
+        need = deficit.unsqueeze(-1) - mult.unsqueeze(-1) * v  # [B,20]
 
-        lo = torch.full_like(want, -cfg.lambda_max)
-        hi = torch.full_like(want, cfg.lambda_max)
-        for _ in range(32):
-            mid = 0.5 * (lo + hi)
-            too_low = expectation(mid) < want
-            lo = torch.where(too_low, mid, lo)
-            hi = torch.where(too_low, hi, mid)
-        lam = 0.5 * (lo + hi)
-        lam = torch.where(skip, torch.zeros_like(lam), lam)
-        return torch.where(active, lam, torch.zeros_like(lam))
+        mu = (n_rem * m_hat).unsqueeze(-1)
+        sigma = (n2_rem * var_hat).clamp(min=eps).sqrt().unsqueeze(-1)
+
+        if self.cfg.mode == "eq":
+            # Soft deadband: no penalty while the requirement sits inside the
+            # tolerance window around what the remainder is expected to give.
+            dist = ((need - mu).abs() - self.cfg.tolerance).clamp(min=0.0)
+            logp = -0.5 * (dist / sigma) ** 2
+        elif self.cfg.mode == "ge":
+            logp = torch.special.log_ndtr((mu - need) / sigma)
+        else:
+            logp = torch.special.log_ndtr((need - mu) / sigma)
+        logp = logp.clamp(min=-50.0)
+        logp = logp - logp.max(dim=-1, keepdim=True).values
+
+        # On the last designable step there is no remainder to look ahead to;
+        # the mask alone decides, so do not let a degenerate sigma shout.
+        logp = torch.where((n_rem > 0.5).unsqueeze(-1), logp, torch.zeros_like(logp))
+
+        # The caller divides by the temperature, so scale to keep this a
+        # likelihood reweighting rather than a temperature-dependent nudge.
+        delta = (self.temperature * logp).clamp(min=-self.cfg.lambda_max)
+        out = torch.zeros_like(base)
+        out[:, :N_AA] = torch.where(
+            active.unsqueeze(-1), delta, torch.zeros_like(delta)
+        )
+        return out
 
     def commit(self, k: int, S_t: torch.Tensor) -> None:
         """Record the residue chosen at step ``k``.
@@ -761,6 +849,15 @@ class _ActiveConstraints:
                         f"alphabet, the achievable range is "
                         f"[{float(st.suf_min[0, 0]):g}, {float(st.suf_max[0, 0]):g}] "
                         f"{term.unit}."
+                    )
+                if not st.exact_feasible_at_start():
+                    raise InfeasibleConstraint(
+                        f"{term.name}: target {term.target:g} {term.unit} is not "
+                        f"reachable. Given the fixed residues and the allowed "
+                        f"alphabet, the achievable interval is "
+                        f"[{float(st.suf_min[0, 0]):g}, {float(st.suf_max[0, 0]):g}] "
+                        f"but the discrete reachable values do not contain the "
+                        f"requested target {term.unit}."
                     )
                 self.warnings.extend(st.exactness_caveats())
                 self.states.append(st)
