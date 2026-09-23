@@ -105,17 +105,34 @@ SPPS_DEFAULT_WEIGHTS: Dict[str, float] = {
     "beta_pair": 3.0,  # per adjacent beta-branched pair
     "beta_run3": 6.0,  # per position extending a beta-branched run to >=3
     "asp_gly": 8.0,  # per Asp-Gly (canonical aspartimide motif)
-    "asp_other": 3.0,  # per other aspartimide-prone Asp-X
+    "asp_other": 3.0,  # per other documented aspartimide-prone Asp-X
     "aliphatic_window": 2.0,  # per excess hydrophobic residue in a window
-    "cys": 0.5,  # per Cys
-    "met": 0.2,  # per Met
 }
+#: Deliberately absent: flat per-residue penalties on Arg (slow coupling, hard
+#: Pbf removal), Cys and Met (oxidation-prone).  Those are real synthesis
+#: considerations, but they are plain composition biases and ``--bias_AA``
+#: already expresses them exactly -- e.g. ``--bias_AA "R:-1.0,M:-1.5"``.  What
+#: ``--spps_bias`` contributes is the part ``--bias_AA`` cannot reach: motifs
+#: that depend on which residues end up NEXT to each other.  Keeping the two
+#: separate also keeps this score interpretable as a motif count.
 
 BETA_BRANCHED = "IVT"
 #: Asp-X motifs prone to aspartimide formation under repeated Fmoc removal,
-#: with Asp-Gly by far the worst.  Set per Mergler et al. and Subiros-Funosas
-#: et al.; the ordering is well established, the magnitudes are not.
-ASP_OTHER_NEXT = "DNSTRCQE"
+#: with Asp-Gly by far the worst.
+#:
+#: The set is taken from the two studies that scanned X directly on the model
+#: peptide Val-Lys-Asp-X-Tyr-Ile: Lauer, Fields & Fields, Lett. Pept. Sci.
+#: 1994, 1:197-205, which saw aspartimide for X = Arg, Asn, Asp, Cys, Gly,
+#: Ser and Thr; and Mergler et al., "The aspartimide problem in Fmoc-based
+#: SPPS, Part II", J. Pept. Sci. 2003, 9:518-526, which saw considerable
+#: by-product for X = Asp, Arg, Asn, Cys and unprotected Thr.  Gln and Glu
+#: were previously included here but are supported by neither, and have been
+#: removed.  Asp-Ser and Asp-Asp, singled out by synthetic chemists alongside
+#: Asp-Gly, are both in the Lauer set.
+#:
+#: The ordering (Gly worst, then the rest) is well established; the numeric
+#: magnitudes are hyperparameters, not measured effect sizes.
+ASP_OTHER_NEXT = "DNSTRC"
 #: Residues counted toward on-resin hydrophobic/aliphatic load.
 ALIPHATIC = "AVILMF"
 SPPS_WINDOW = 7
@@ -152,8 +169,6 @@ def spps_risk(
         "asp_gly": 0.0,
         "asp_other": 0.0,
         "aliphatic_window": 0.0,
-        "cys": 0.0,
-        "met": 0.0,
     }
     for i, aa in enumerate(seq):
         if aa in BETA_BRANCHED:
@@ -172,10 +187,6 @@ def spps_risk(
                 comp["asp_gly"] += 1.0
             elif nxt in ASP_OTHER_NEXT:
                 comp["asp_other"] += 1.0
-        if aa == "C":
-            comp["cys"] += 1.0
-        if aa == "M":
-            comp["met"] += 1.0
     for start in range(0, max(1, n - SPPS_WINDOW + 1)):
         window = seq[start : start + SPPS_WINDOW]
         hydrophobic = sum(1 for aa in window if aa in ALIPHATIC)
@@ -661,10 +672,6 @@ class _SPPSState:
             c = 0.0
             if aa in BETA_BRANCHED:
                 c += w["beta_branched"]
-            if aa == "C":
-                c += w["cys"]
-            if aa == "M":
-                c += w["met"]
             self.unary[idx] = c
         self.is_beta = [ALPHABET[i] in BETA_BRANCHED for i in range(N_TOKENS)]
         self.is_hydro = [ALPHABET[i] in ALIPHATIC for i in range(N_TOKENS)]

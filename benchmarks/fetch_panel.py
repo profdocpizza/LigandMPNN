@@ -10,6 +10,7 @@ commands are uniform.
 """
 
 import os
+import shutil
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -22,8 +23,12 @@ PANEL = [
     ("1SHG", 62, "beta"), ("1CSP", 67, "beta"), ("1MJC", 69, "beta"),
     ("1UBQ", 76, "alpha+beta"), ("2PTL", 78, "alpha+beta"), ("2CI2", 83, "alpha+beta"),
     ("1LMB", 87, "alpha"), ("1TEN", 90, "beta"), ("1RIS", 97, "alpha+beta"),
-    ("1FKB", 107, "alpha+beta"),
+    ("1FKB", 107, "alpha+beta"), ("1EMA", 238, "beta barrel"),
 ]
+
+# SPPS is only meaningful for peptides that can actually be made on resin,
+# so that benchmark uses its own 20-60 aa panel drawn from the same files.
+PEPTIDES = ["1L2Y", "1VII", "1ENH", "1PGA", "1BDD"]
 
 AA3 = {
     "ALA","ARG","ASN","ASP","CYS","GLN","GLU","GLY","HIS","ILE",
@@ -83,7 +88,12 @@ def main():
         rows.append((pid, n_res, approx, fold, chain, nmr))
         print(f"{pid}  {source:9s}  {n_res:4d} res (expected ~{approx})  chain {chain}  "
               f"{'NMR' if nmr else 'X-ray'}  {fold}")
-    print(f"\n{len(rows)} structures -> {os.path.relpath(OUT, HERE)}")
+    pep = os.path.join(HERE, "structures", "peptides")
+    os.makedirs(pep, exist_ok=True)
+    for pid in PEPTIDES:
+        shutil.copyfile(os.path.join(OUT, f"{pid}.pdb"), os.path.join(pep, f"{pid}.pdb"))
+    print(f"\npeptide panel ({len(PEPTIDES)}): {', '.join(PEPTIDES)} -> structures/peptides")
+    print(f"{len(rows)} structures -> {os.path.relpath(OUT, HERE)}")
     print("length range: %d-%d" % (min(r[1] for r in rows), max(r[1] for r in rows)))
 
 

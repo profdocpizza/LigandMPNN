@@ -19,9 +19,9 @@ prunes them before sampling. Two of the three are therefore not biases but
 
 | I want... | Flag | What you get | Typical cost |
 |---|---|---|---|
-| A specific net charge | `--target_charge -8` | Exactly that charge, every design | +0.06 nats near the model's own charge |
+| A specific net charge | `--target_charge -8` | Exactly that charge, every design | {charge_cost_0} nats near the model's own charge |
 | Roughly that charge, cheaper | `--target_charge -8 --charge_tolerance 2` | Within ±2 e, every design | less than exact; see §5 |
-| To quantify protein by A280 | `--min_extinction_280 5500` | At least one Trp, every design | +0.08 nats |
+| To quantify protein by A280 | `--min_extinction_280 5500` | At least one Trp, every design | {e280_cost} nats |
 | An easier peptide to synthesise | `--spps_bias 1.0` | Fewer synthesis-risk motifs, **no guarantee** | depends on fold; see §7 |
 
 All three work with every `--model_type` (`protein_mpnn`, `soluble_mpnn`,
@@ -119,32 +119,32 @@ comparable between constrained and unconstrained runs.
 
 ![charge benchmark](../benchmarks/figures/charge_benchmark.png)
 
-Across 17 backbones of 20-221
+Across {charge_n_backbones} backbones of {charge_len_lo}-{charge_len_hi}
 residues, spanning α, β and α+β folds, with targets set relative to each
 backbone's own unconstrained mean charge:
 
-* **3808/3808 designs hit the requested charge exactly**, over
-  119 backbone × target conditions, with
-  0 infeasible requests.
-* Cost is +0.06 nats at the charge the model already prefers, rising
-  to +0.43 at a 15 e shift.
+* **{charge_exact} designs hit the requested charge exactly**, over
+  {charge_conditions} backbone × target conditions, with
+  {charge_infeasible} infeasible requests.
+* Cost is {charge_cost_0} nats at the charge the model already prefers, rising
+  to {charge_cost_15} at a 15 e shift.
 
 Targets are set *relative to each backbone* because an absolute charge is not
 comparable across sizes. The cost of a shift tracks the **per-residue** demand
-much better than the absolute one (r = 0.81 versus
-0.51): a 15 e shift is a large ask on a 20-mer and a small one on a
+much better than the absolute one (r = {charge_r_perres} versus
+{charge_r_abs}): a 15 e shift is a large ask on a 20-mer and a small one on a
 150-mer.
 
 An unreachable target is refused at setup with a message naming the achievable
 range, rather than silently missed.
 
 **Tolerance.** `--charge_tolerance` is a deadband: inside the window the
-model's own preference is left alone. At `--target_charge -15`,
-widening to ±8 e drops the NLL from 0.95 to
-0.84, and 96/96 designs still land inside the requested
+model's own preference is left alone. At `--target_charge {tol_target}`,
+widening to ±{tol_wide} e drops the NLL from {tol_nll_exact} to
+{tol_nll_wide}, and {tol_inside} designs still land inside the requested
 window.
 
-**Model types.** 240/240 designs exact across `ligand_mpnn`, `protein_mpnn`, `soluble_mpnn`.
+**Model types.** {models_exact} designs exact across {models_list}.
 
 ---
 
@@ -156,15 +156,15 @@ window.
 reduced). `--min_extinction_280 5500` therefore guarantees at least one Trp;
 1490 guarantees at least one Trp or Tyr.
 
-This is a real problem, not a contrived one. Of 17 backbones,
-**7 produce a Trp in fewer than half their unconstrained designs
-and 4 produce none at all** (1BDD, 1LMB, 1UBQ, 2PTL) -- those designs
+This is a real problem, not a contrived one. Of {e280_n} backbones,
+**{e280_lowtrp} produce a Trp in fewer than half their unconstrained designs
+and {e280_notrp} produce none at all** ({e280_notrp_list}) -- those designs
 cannot be quantified by A280 at all.
 
-* **1632/1632 constrained designs meet the requested floor.**
-* Across model types the floor is met in 96/96 constrained designs
-  versus 0/48 unconstrained (ligand_mpnn, protein_mpnn, soluble_mpnn).
-* Cost is about +0.08 nats, and the shift is concentrated in Trp and Tyr
+* **{e280_met} constrained designs meet the requested floor.**
+* Across model types the floor is met in {e280_models_met} constrained designs
+  versus {e280_models_base} unconstrained ({e280_models}).
+* Cost is about {e280_cost} nats, and the shift is concentrated in Trp and Tyr
   rather than spread across the composition.
 
 Note the flag is named for the **extinction coefficient**, not absorbance.
@@ -203,19 +203,15 @@ concerns, but they are plain composition biases and `--bias_AA` already
 expresses them exactly, e.g. `--bias_AA "R:-1.0,M:-1.5"`. `--spps_bias` covers
 only what `--bias_AA` cannot: motifs that depend on adjacency.
 
-On 5 peptides of 20-60 residues sampled
-at T = 0.3, mean risk falls from 15 to 2 by bias 1.0.
+On {spps_n_peptides} peptides of {spps_len_lo}-{spps_len_hi} residues sampled
+at T = 0.3, mean risk falls from {spps_risk0} to {spps_risk1} by bias 1.0.
 
 **The cost depends on the fold, and is predictable from it.** Sheet fractions
 below are measured from the input backbones' φ/ψ angles:
 
-| Peptide | Length | Sheet | NLL cost at bias 2 |
+| Peptide | Length | Sheet | NLL cost at bias {spps_bias_max} |
 |---|---|---|---|
-| 1L2Y | 20 | 22% | -0.00 |
-| 1VII | 36 | 18% | +0.05 |
-| 1ENH | 54 | 23% | +0.02 |
-| 1PGA | 56 | 54% | +0.32 |
-| 1BDD | 60 | 9% | +0.08 |
+{spps_table}
 
 The only expensive peptide is the only β-sheet-rich one. That is
 mechanistically direct: β-strands are built from Ile/Val/Thr, so penalising
@@ -223,7 +219,7 @@ mechanistically direct: β-strands are built from Ile/Val/Thr, so penalising
 designs get SPPS friendliness nearly free; β-rich designs pay for it.**
 
 Two honest caveats. Asp-Gly is *rare* in unconstrained designs even on
-peptides chosen to elicit it (0.09 per design on average here), so the
+peptides chosen to elicit it ({spps_dg0} per design on average here), so the
 β-branched terms carry most of the signal. And because MPNN decodes in random
 order, a motif can still form when both residues are decided before either
 sees the other -- which is why this flag steers and does not guarantee.
@@ -241,20 +237,16 @@ by construction drawn from the true conditional, so their mean NLL is the
 honest reference for what conditioning costs. Anything above it is distortion
 introduced by the controller.
 
-Over 40 backbone × charge cells on 5 backbones with
-384-design pools:
+Over {rej_cells} backbone × charge cells on {rej_backbones} backbones with
+{rej_pool}-design pools:
 
-* **Median gap to exact conditioning: +0.047 nats** (max +0.184).
-* 960/960 constrained designs still exactly on target.
-* The gap shrinks with chain length (r = -0.75):
+* **Median gap to exact conditioning: {rej_median} nats** (max {rej_max}).
+* {rej_exact} constrained designs still exactly on target.
+* The gap shrinks with chain length (r = {rej_r}):
 
 | Backbone | Length | Mean gap |
 |---|---|---|
-| 1VII | 36 | +0.132 |
-| 1ENH | 54 | +0.080 |
-| 1UBQ | 76 | +0.058 |
-| 1PIN | 153 | +0.034 |
-| 1EMA | 221 | +0.029 |
+{rej_table}
 
 This is the predicted behaviour rather than a lucky result: the lookahead
 approximates the sum over undecoded positions as normal, which is a

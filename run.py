@@ -1220,7 +1220,14 @@ def main(args) -> None:
 # that are being written to the FASTA file (i.e., selected ones if filter is on).
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    """The command-line interface.
+
+    Exposed as a function so that callers (the benchmarks in ``benchmarks/``)
+    can drive ``main()`` in-process with exactly the arguments the command
+    line would have produced, instead of paying a fresh interpreter start and
+    CUDA context for every invocation.  Behaviour of the CLI is unchanged.
+    """
     argparser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
@@ -1591,10 +1598,13 @@ if __name__ == "__main__":
         default=0.0,
         help="Strength of the Fmoc-SPPS synthesis-risk penalty (0 off, 0.5 "
         "gentle, 1.0 a reasonable default, 2.0 synthesis strongly prioritised). "
-        "Penalises Asp-Gly and other aspartimide-prone Asp-X motifs, "
-        "beta-branched runs, hydrophobic windows, Cys and Met. This one steers "
-        "and does not guarantee: MPNN decodes in random order, so only "
-        "already-decoded neighbours are visible when a position is decided.",
+        "Penalises sequence-neighbour motifs: Asp-Gly and other "
+        "aspartimide-prone Asp-X, adjacent and run-forming beta-branched "
+        "residues, and hydrophobic windows. Flat per-residue preferences "
+        "(avoiding Arg, Cys or Met) are not included here because --bias_AA "
+        "already expresses them. This one steers and does not guarantee: MPNN "
+        "decodes in random order, so only already-decoded neighbours are "
+        "visible when a position is decided.",
     )
     argparser.add_argument(
         "--constraint_scope",
@@ -1622,5 +1632,8 @@ if __name__ == "__main__":
         "Reporting is automatic whenever a constraint is active.",
     )
 
-    args = argparser.parse_args()
-    main(args)
+    return argparser
+
+
+if __name__ == "__main__":
+    main(build_parser().parse_args())

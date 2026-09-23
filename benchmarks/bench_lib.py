@@ -5,10 +5,13 @@ the FASTA headers.  Nothing is computed through a private code path, so the
 numbers reported are the numbers the CLI produces.
 """
 
+import gc
+import io
 import math
 import os
 import re
 import subprocess
+from contextlib import redirect_stderr, redirect_stdout
 import sys
 import tempfile
 
@@ -23,6 +26,87 @@ from constraints import (  # noqa: E402
 )
 
 PYTHON = os.environ.get("PYTHON", sys.executable)
+
+# Driving run.main() in-process reuses the interpreter, the imported torch and
+# the CUDA context, which on a GPU dominate the cost of a small design batch.
+# It is the SAME code path as the CLI -- the arguments go through run.py's own
+# parser and into its own main() -- so the numbers are still the CLI's numbers.
+# Set BENCH_INPROC=0 to force the subprocess path; tests/test_inproc_matches.py
+# checks the two agree bit for bit.
+INPROC = os.environ.get("BENCH_INPROC", "1") not in ("0", "false", "False")
+_RUN = None
+_PARSER = None
+
+
+#: Peak activation scales with batch_size * n_residues. 12000 keeps a 4080
+#: comfortable; override with BENCH_MAX_BATCH_RESIDUES.
+MAX_BATCH_RESIDUES = int(os.environ.get("BENCH_MAX_BATCH_RESIDUES", "12000"))
+_LEN_CACHE = {}
+
+
+def _n_residues(pdb_path):
+    if pdb_path not in _LEN_CACHE:
+        with open(pdb_path) as fh:
+            _LEN_CACHE[pdb_path] = len(
+                {l[21:27] for l in fh if l.startswith("ATOM") and l[12:16].strip() == "CA"}
+            )
+    return _LEN_CACHE[pdb_path] or 1
+
+
+def _split_batches(pdb_path, batch_size, n_batches):
+    """Shrink the batch and add batches so the design count is unchanged."""
+    L = _n_residues(pdb_path)
+    cap = max(1, MAX_BATCH_RESIDUES // L)
+    if batch_size <= cap:
+        return batch_size, n_batches
+    total = batch_size * n_batches
+    new_bs = cap
+    new_nb = -(-total // new_bs)          # ceil, so never fewer designs
+    return new_bs, new_nb
+
+
+def _run_inproc(cli):
+    """Call run.main() with CLI-parsed args; returns (stdout, stderr, rc)."""
+    global _RUN, _PARSER
+    if _RUN is None:
+        cwd = os.getcwd()
+        os.chdir(REPO)
+        try:
+            import run as _run_mod
+        finally:
+            os.chdir(cwd)
+        _RUN = _run_mod
+        _PARSER = _run_mod.build_parser()
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    cwd = os.getcwd()
+    os.chdir(REPO)
+    try:
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            _RUN.main(_PARSER.parse_args(cli))
+        rc = 0
+    except SystemExit as exc:  # argparse on a bad flag
+        rc = int(exc.code or 0)
+    except Exception as exc:  # infeasible constraint, bad input
+        buf_err.write(f"{type(exc).__name__}: {exc}")
+        rc = 1
+    finally:
+        os.chdir(cwd)
+        # run.main() builds a fresh model on the device every call. As a
+        # subprocess, process exit reclaimed that; in-process it accumulates
+        # until the GPU runs out, so drop it explicitly.
+        _free_device_memory()
+    return buf_out.getvalue(), buf_err.getvalue(), rc
+
+
+def _free_device_memory():
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
 STRUCTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "structures")
 
 CHECKPOINTS = {
@@ -51,6 +135,7 @@ def run_design(
     extra_args=(),
     out_folder=None,
     allow_failure=False,
+    inproc=None,
 ):
     """Run one ``run.py`` invocation and return parsed designs.
 
@@ -58,9 +143,8 @@ def run_design(
     e280, spps_risk}], "stderr": str}``.
     """
     tmp = out_folder or tempfile.mkdtemp(prefix="bench_")
-    cmd = [
-        PYTHON,
-        "run.py",
+    batch_size, n_batches = _split_batches(pdb_path, batch_size, n_batches)
+    cli = [
         "--model_type",
         model_type,
         f"--checkpoint_{model_type}",
@@ -83,11 +167,17 @@ def run_design(
         "1",
         *[str(a) for a in extra_args],
     ]
-    env = dict(os.environ, PYTHONPATH=REPO)
-    env.pop("PYTHONSAFEPATH", None)
-    proc = subprocess.run(
-        cmd, cwd=REPO, capture_output=True, text=True, env=env, timeout=7200
-    )
+    use_inproc = INPROC if inproc is None else inproc
+    if use_inproc:
+        out, err, rc = _run_inproc(cli)
+    else:
+        env = dict(os.environ, PYTHONPATH=REPO)
+        env.pop("PYTHONSAFEPATH", None)
+        proc = subprocess.run(
+            [PYTHON, "run.py", *cli], cwd=REPO, capture_output=True, text=True,
+            env=env, timeout=7200,
+        )
+        out, err, rc = proc.stdout, proc.stderr, proc.returncode
     stem = os.path.splitext(os.path.basename(pdb_path))[0]
     fasta = os.path.join(tmp, "seqs", f"{stem}.fa")
     if not os.path.exists(fasta):
@@ -95,13 +185,13 @@ def run_design(
             return {
                 "native": None,
                 "designs": [],
-                "stderr": proc.stderr,
-                "stdout": proc.stdout,
-                "returncode": proc.returncode,
+                "stderr": err,
+                "stdout": out,
+                "returncode": rc,
             }
         raise RuntimeError(
-            f"run.py produced no FASTA (exit {proc.returncode}).\n"
-            f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+            f"run.py produced no FASTA (exit {rc}).\n"
+            f"{out[-2000:]}\n{err[-2000:]}"
         )
 
     records = []
@@ -136,9 +226,9 @@ def run_design(
     return {
         "native": native,
         "designs": designs,
-        "stderr": proc.stderr,
-        "stdout": proc.stdout,
-        "returncode": proc.returncode,
+        "stderr": err,
+        "stdout": out,
+        "returncode": rc,
     }
 
 

@@ -6,257 +6,35 @@ Third party code: side chain packing uses helper functions from [Openfold](https
 
 ---
 
-## Constrained decoding: charge, A280 detectability, SPPS friendliness
+## Constrained decoding: net charge, A280 detectability, SPPS friendliness
 
-This fork adds three deterministic constraints that are applied **while the
-model decodes**, so a design can be required to have a given net charge, to
-carry a 280 nm chromophore, or to avoid known solid-phase-peptide-synthesis
-failure motifs.
+This fork can *require* a design to have a given net charge, to carry a 280 nm
+chromophore so it can be quantified by A280, or to avoid known solid-phase
+peptide synthesis failure motifs. The constraints are applied while the model
+decodes: no weights are retrained and no checkpoint is modified.
 
-No weights are retrained and no checkpoint is modified. At each autoregressive
-step MPNN emits 21 amino-acid logits; a deterministic layer re-weights and
-prunes them before sampling. Two of the three constraints are therefore not
-biases but **guarantees**, verified on every sampled design.
+```bash
+python run.py --model_type soluble_mpnn \
+    --checkpoint_soluble_mpnn ./model_params/solublempnn_v_48_020.pt \
+    --pdb_path ./inputs/1BC8.pdb --out_folder ./out \
+    --target_charge -8 --min_extinction_280 5500
+```
 
 | Flag | What it does | Guarantee |
 |---|---|---|
-| `--target_charge -4` | Net charge of the designed sequence | **Exact** (1248/1248 designs across 3 models and 13 targets) |
-| `--min_extinction_280 5500` | Molar extinction coefficient at 280 nm | **Lower bound always met** (192/192 designs) |
-| `--spps_bias 1.0` | Penalises Fmoc-SPPS risk motifs | **None** — steering only; see below |
+| `--target_charge -8` | Net charge of the designed sequence | **Exact** |
+| `--min_extinction_280 5500` | Molar extinction coefficient at 280 nm | **Lower bound always met** |
+| `--spps_bias 1.0` | Penalises Fmoc-SPPS risk motifs | Steers only, no guarantee |
 
-```bash
-# A ubiquitin redesign that must carry exactly -8 net charge
-python run.py --model_type soluble_mpnn \
-    --checkpoint_soluble_mpnn ./model_params/solublempnn_v_48_020.pt \
-    --pdb_path ./benchmarks/structures/1UBQ.pdb --out_folder ./outputs/charge \
-    --batch_size 8 --target_charge -8
+Works with every `--model_type`. With no new flags the output is
+byte-identical to upstream, verified across all five model types by
+`tests/test_identical_to_upstream.sh`.
 
-# A peptide guaranteed to have at least one Trp, so A280 can quantify it
-python run.py --model_type soluble_mpnn \
-    --checkpoint_soluble_mpnn ./model_params/solublempnn_v_48_020.pt \
-    --pdb_path ./benchmarks/structures/1VII.pdb --out_folder ./outputs/uv \
-    --batch_size 8 --min_extinction_280 5500
-
-# All three at once
-python run.py --model_type ligand_mpnn \
-    --checkpoint_ligand_mpnn ./model_params/ligandmpnn_v_32_010_25.pt \
-    --pdb_path ./inputs/1BC8.pdb --out_folder ./outputs/combined \
-    --batch_size 8 --target_charge 4 --min_extinction_280 5500 --spps_bias 1.0
-```
-
-With any constraint active, or with `--report_properties 1`, the measured
-values are written into the FASTA header so baselines are directly comparable:
-
-```
->1UBQ, id=1, T=0.1, seed=5, overall_confidence=0.2884, ligand_confidence=0.2884,
- seq_rec=0.4342, net_charge=-8, e280=11000, spps_risk=12.40
-```
-
-### How it works
-
-Charge and extinction coefficient are both **linear functionals of
-composition**: `f(seq) = Σ v[seq_i]`. That shared structure means one
-controller handles both, in two stages per decoding step.
-
-1. **Soft steering.** A multiplier `λ` is found by bisection so the expected
-   value contributed by this step matches the per-position requirement implied
-   by what is still outstanding. This spreads the requirement over the whole
-   chain instead of dumping it on whichever positions happen to decode last.
-   `E_λ[v]` is strictly increasing in `λ`, so the bisection is unconditionally
-   safe.
-2. **Hard reachability pruning.** Any amino acid whose selection would make
-   the target unreachable by the positions not yet decoded is masked out. The
-   reachable interval is precomputed as a suffix sum over each batch row's own
-   decoding order, accounting for fixed residues and per-position omissions.
-
-Stage 2 is what turns "approximately the requested charge" into "exactly the
-requested charge". Stage 1 is what keeps the sequence sensible while doing so.
-
-SPPS risk is **not** a linear functional — Asp-Gly and β-branched runs depend
-on sequence neighbours. Because MPNN decodes in a random order, some
-neighbours of the position being decided do not exist yet, so the penalty sees
-partial context and acts greedily. Hence: no guarantee.
-
-The accurate name for this is **constrained decoding**. It is the protein-design
-analogue of constrained text generation — "NeuroLogic Decoding: (Un)supervised
-Neural Text Generation with Predicate Logic Constraints" and its successor
-["NeuroLogic A*esque Decoding: Constrained Text Generation with Lookahead
-Heuristics"](https://aclanthology.org/2022.naacl-main.57/) (Lu et al., NAACL
-2022), where lookahead estimates of future constraint satisfaction guide an
-autoregressive decoder. Applying constrained decoding to ProteinMPNN is not
-new either: ["A novel decoding strategy for ProteinMPNN to design with less
-visibility to cytotoxic T-lymphocytes"](https://doi.org/10.1016/j.csbj.2025.07.055)
-(Computational and Structural Biotechnology Journal, 2025) steers designs away
-from peptides predicted to be presented by MHC class I. What is added here is
-the constraint set and the exactness.
-
-### Non-destructive by construction
-
-The hook is gated on `feature_dict.get("constraints")`, so with no new flags
-the original arithmetic runs untouched. This is verified rather than asserted:
-
-```
-bash tests/test_identical_to_upstream.sh
-```
-
-runs every model type at a fixed seed from both the base revision and the
-working tree and compares the FASTA output byte for byte.
-
-```
-IDENTICAL  protein_mpnn 1BC8                    IDENTICAL  protein_mpnn 2GFB
-IDENTICAL  soluble_mpnn 1BC8                    IDENTICAL  soluble_mpnn 2GFB
-IDENTICAL  ligand_mpnn 1BC8                     IDENTICAL  ligand_mpnn 2GFB
-IDENTICAL  global_label_membrane_mpnn 1BC8      IDENTICAL  global_label_membrane_mpnn 2GFB
-IDENTICAL  per_residue_label_membrane_mpnn 1BC8 IDENTICAL  per_residue_label_membrane_mpnn 2GFB
-```
-
-`sample()` is one method shared by every model type, so the constraints work
-with `protein_mpnn`, `soluble_mpnn`, `ligand_mpnn` and both membrane variants
-without per-model code. They compose with `--fixed_residues`,
-`--redesigned_residues`, `--omit_AA`, `--bias_AA`, `--symmetry_residues` and
-the existing per-residue JSON options. `log_probs` is still computed from the
-raw logits, so `overall_confidence` stays comparable to unconstrained runs.
-
-Unit tests: `python tests/test_constraints.py` (14 tests).
-
-### Exact definitions
-
-Read these before quoting a number; each quantity is a specific convention,
-not a measurement.
-
-**Net charge** counts Asp and Glu as −1, Lys and Arg as +1. His is treated as
-**neutral** — its side-chain pKa near 6.0 leaves it roughly 10 % protonated at
-pH 7.4, and a fractional value would forfeit the exact-integer guarantee. Free
-α-amino and α-carboxyl termini are **not** counted; for a single chain they
-cancel. This is a design-time convention, not a predicted titration curve.
-
-**ε₂₈₀** is `5500·n_Trp + 1490·n_Tyr` M⁻¹cm⁻¹, from [Pace et al., Protein Sci
-4:2411 (1995)](https://doi.org/10.1002/pro.5560041120), for a protein with all
-cysteines **reduced**. Each cystine disulfide adds ≈125 M⁻¹cm⁻¹; disulfide
-connectivity is not a function of sequence alone, so it is excluded and the
-reported value is a lower bound for an oxidised protein. The flag guarantees an
-extinction coefficient, **not** an absorbance — absorbance additionally depends
-on concentration and path length. Useful values: `1490` = at least one Tyr,
-`5500` = at least one Trp, `11000` = two Trp equivalents.
-
-**Scope** (`--constraint_scope`) decides which residues a property is computed
-over. The default `designed_chains` uses every residue of any chain containing
-a designable position, so fixed native residues count toward the target — which
-is what "this protein should have net charge −4" normally means.
-`designed_positions` uses only the redesigned positions. If a target is
-unreachable given the fixed residues, the run fails immediately with the
-achievable range rather than silently missing:
-
-```
-constraints.InfeasibleConstraint: net_charge: target -3 e is not reachable.
-Given the fixed residues and the allowed alphabet, the achievable range is [-2, 2] e.
-```
-
-**SPPS risk** is a dimensionless ranking heuristic, not a predicted synthesis
-yield. It sums the well-documented Fmoc-SPPS failure modes — Asp-Gly and weaker
-aspartimide-prone Asp-X motifs, β-branched Ile/Val/Thr adjacency and runs,
-sliding-window aliphatic load, Cys and Met counts. **The weights are
-hyperparameters chosen to rank these modes in a sensible order; they are not
-measured effect sizes from the literature.** They live in one dict
-(`SPPS_DEFAULT_WEIGHTS` in `constraints.py`) so you can retune them for your
-chemistry. Two rules were deliberately left out: penalising Arg in favour of
-Lys, because Arg(Pbf) has been reported to *reduce* resin-bound aggregation
-where Lys(Boc) increases it; and rewarding Pro, because poly-Pro did not
-reliably suppress on-resin aggregation.
-
-### What is not claimed
-
-- **No structural validation.** Nothing here was folded, and no design was
-  expressed, synthesised or measured. The composition and sequence metrics
-  shown here demonstrate what residues the constraint changes, not whether a
-  design folds. A self-consistency check (fold the designs, measure RMSD to the
-  input backbone) is the obvious next step and has not been done.
-- **The charge convention is not a pI or a titration model.** If you need pI or
-  pH-dependent charge, compute it from the output sequence with a proper tool.
-- **The SPPS term is untested against real synthesis.** It encodes literature
-  failure modes; it does not predict whether a peptide will actually couple.
-- **Joint hard constraints can compete.** Reachability is computed per
-  constraint, not jointly, so an exact charge target combined with a high
-  extinction floor on a very short peptide could in principle over-restrict a
-  position. `run.py` verifies every sampled design against every hard
-  constraint and prints a warning if any missed; no violation was observed in
-  any benchmark run.
-- **Discrete reachability matters for equality constraints.** Integer-valued
-  equality targets, including tied symmetry groups and omitted residues, are
-  checked against their discrete reachable set. If a target is impossible, the
-  run raises an `InfeasibleConstraint` with the reachable interval rather than
-  silently returning a miss. Non-integer equality functionals still use the
-  interval fallback.
-
-### Benchmarks
-
-Reproduce with:
-
-```bash
-python benchmarks/fetch_panel.py       # downloads the panel only when missing
-python benchmarks/bench_charge.py       # charge sweep plus 0/+-4 tolerance arms
-python benchmarks/bench_extinction.py   # ~3 min
-python benchmarks/bench_spps.py         # ~8 min
-python benchmarks/make_figures.py       # needs pandas + matplotlib only
-```
-
-Each benchmark shells out to `run.py` exactly as a user would and parses the
-FASTA headers, so the numbers are the numbers the CLI produces. Raw per-design
-results are in `benchmarks/results/*.csv`.
-
-#### 1. Charge, on ubiquitin (1UBQ, 76 aa, whole chain redesigned)
-
-![charge benchmark](benchmarks/figures/charge_benchmark.png)
-
-Sweeping the target from −30 to +30 across `protein_mpnn`, `soluble_mpnn` and
-`ligand_mpnn`, 32 designs each: **1248/1248 designs hit the requested charge
-exactly.** Left to itself the model produces about −5 e on this backbone
-(native ubiquitin is 0 e), so most of this range is a long way from what it
-would choose.
-
-The composition panel uses target −5 e, near the unconstrained mean. The
-requested shift is visible primarily in D/E/K/R, while the other residues move
-less. The tolerance panel reports the mean absolute frequency change separately
-for D/E/K/R and the other 16 residues, rather than treating MPNN's own NLL as a
-biophysical quality score.
-
-#### 2. ε₂₈₀, on the villin headpiece (1VII, 36 aa, SolubleMPNN)
-
-![extinction benchmark](benchmarks/figures/extinction_benchmark.png)
-
-The updated benchmark uses four backbones, three model types, and 50 designs
-per threshold. The composition comparison uses 1VII with SolubleMPNN. Native
-HP36 has exactly one Trp, but unconstrained designs can be low in ε₂₈₀; a set
-without a chromophore cannot be quantified by A280.
-
-The swarm shows the final ε₂₈₀ values for requests off, 0, 1000, 2000, 4000,
-8000 and 16000. Every constrained design meets its requested floor. The
-composition panel shows that the largest change is the required Trp/Tyr usage;
-the other residues move much less on the selected 1VII comparison. This is a
-sequence-level composition result, not evidence that the designs fold.
-
-#### 3. SPPS risk, on two targets
-
-![SPPS benchmark](benchmarks/figures/spps_benchmark.png)
-
-1VII (36 aa) is comfortably in routine Fmoc-SPPS range, and its designs contain
-**no Asp-Gly at all** — so on this target the score is driven almost entirely
-by β-branched load, which falls from 4.77 to 0.00 as the bias goes 0 → 2.
-Reporting that honestly matters: the headline aspartimide rule has nothing to
-do here.
-
-1PGA (the B1 domain of protein G, 56 aa, sampled at T=0.3) is the target where
-aspartimide motifs actually appear. Asp-Gly is present in 14.1 % of
-unconstrained designs, 7.8 % at bias 0.5, and **0 % from bias 1.0 upward**;
-β-branched residues fall from 17.7 to 7.0 per design at bias 1.0.
-
-The composition panel makes the trade-off explicit without using model NLL.
-GB1's native sequence scores 54.2 on this risk scale — essentially the same as
-the unconstrained designs — because its β-sheet core genuinely is
-β-branched-rich. Driving the risk to zero means removing the residues that
-build that sheet. `--spps_bias` is a dial on a real trade-off, not a free
-improvement; 0.5–1.0 is where it removes the classic motifs while keeping the
-composition shift smaller than at extreme bias.
+**[Full documentation, benchmarks and limitations →
+docs/CONSTRAINED_DECODING.md](docs/CONSTRAINED_DECODING.md)** — what is
+guaranteed and what is only steered, measured costs against a
+rejection-sampling reference, the assumptions behind each quantity, and what
+was not tested (no folding, expression or synthesis validation).
 
 ---
 
