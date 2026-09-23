@@ -30,7 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bench_lib import mean, run_design, spps_risk
+from bench_lib import mean, require_structures, run_design, spps_risk
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANEL = os.path.join(HERE, "structures", "panel")
@@ -250,6 +250,10 @@ if __name__ == "__main__":
     ap.add_argument("--n-baseline", type=int, default=24)
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
+    require_structures(
+        *[os.path.join(PANEL, f"{n}.pdb") for n, _ in REJ_BACKBONES],
+        *[os.path.join(PEPTIDE_DIR, f"{n}.pdb") for n in PEPTIDES],
+    )
     rejection(a.pool, a.n_designs, a.min_bin)
     models(a.n_small, a.n_baseline)
     tolerance(a.n_small)

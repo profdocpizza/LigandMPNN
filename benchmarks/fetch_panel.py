@@ -9,6 +9,7 @@ commands are uniform.
     python benchmarks/fetch_panel.py
 """
 
+import argparse
 import os
 import shutil
 import urllib.request
@@ -65,12 +66,12 @@ def clean(raw):
     return kept, n_res, best, seen_model
 
 
-def main():
+def main(force=False):
     os.makedirs(OUT, exist_ok=True)
     rows = []
     for pid, approx, fold in PANEL:
         dest = os.path.join(OUT, f"{pid}.pdb")
-        if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        if not force and os.path.exists(dest) and os.path.getsize(dest) > 0:
             with open(dest) as fh:
                 raw = fh.read()
             source = "existing"
@@ -98,4 +99,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--force", action="store_true",
+                    help="re-download even if a cleaned file is already present")
+    main(**vars(ap.parse_args()))

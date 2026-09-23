@@ -20,7 +20,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from bench_lib import mean, run_design
+from bench_lib import mean, require_structures, run_design
+from fetch_panel import PANEL
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANEL_DIR = os.path.join(HERE, "structures", "panel")
@@ -37,6 +38,8 @@ def backbones():
 
 
 def main(n_designs, n_baseline):
+    require_structures(*[os.path.join(PANEL_DIR, f"{p[0]}.pdb")
+                         for p in PANEL])
     os.makedirs(OUT, exist_ok=True)
     charge_rows, e280_rows = [], []
 

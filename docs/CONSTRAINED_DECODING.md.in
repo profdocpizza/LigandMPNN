@@ -315,10 +315,18 @@ on its own -- about ten times the current gap.
 
 ```bash
 conda activate ligandmpnn_env
+python benchmarks/fetch_panel.py      # input structures, from RCSB
 bash benchmarks/run_all_gpu.sh        # all results, any device
 python benchmarks/make_figures.py     # needs pandas + matplotlib
 python benchmarks/make_docs.py        # regenerates this file
 ```
+
+Input structures are **not** kept in the repository -- they are public PDB
+entries, so `fetch_panel.py` downloads and cleans them on demand (first model,
+largest protein chain, standard residues, single altloc, chain relabelled A).
+It skips anything already present; pass `--force` to re-download.
+`run_all_gpu.sh` calls it for you, and the benchmarks fail with that command
+in the message if a structure is missing.
 
 The benchmarks drive `run.py` through its own argument parser and `main()`, so
 the numbers are the numbers the CLI produces; `tests/test_inproc_matches.py`

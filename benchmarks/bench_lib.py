@@ -119,6 +119,23 @@ AA20 = ALPHABET[:20]
 _HEADER_FIELD = re.compile(r"([A-Za-z0-9_]+)=([^,]+)")
 
 
+def require_structures(*paths):
+    """Fail with the fix, not a bare FileNotFoundError.
+
+    Input structures are gitignored and fetched on demand, so a fresh clone
+    has none of them.
+    """
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        names = ", ".join(sorted(os.path.basename(p) for p in missing[:6]))
+        more = f" (+{len(missing) - 6} more)" if len(missing) > 6 else ""
+        raise SystemExit(
+            f"missing input structures: {names}{more}\n"
+            f"They are not kept in the repository. Fetch them with:\n"
+            f"    python benchmarks/fetch_panel.py"
+        )
+
+
 def native_sequence(pdb_path):
     """One-letter sequence of the input structure, from run.py's own parser."""
     designs = run_design(pdb_path, "protein_mpnn", batch_size=1, n_batches=1, seed=1)
@@ -277,6 +294,7 @@ __all__ = [
     "mean",
     "native_sequence",
     "net_charge",
+    "require_structures",
     "run_design",
     "spps_risk",
 ]
